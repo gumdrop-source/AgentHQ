@@ -20,15 +20,21 @@ REPO_URL="${AGENTHQ_REPO_URL:-https://github.com/gumdrop-source/AgentHQ.git}"
 REPO_REF="${AGENTHQ_REPO_REF:-main}"
 INSTALL_DIR="${AGENTHQ_INSTALL_DIR:-/opt/AgentHQ}"
 
+# Raw URL — derived from REPO_URL, used to re-fetch this script under sudo.
+# raw.githubusercontent.com is the right host (https://github.com/.../raw/...
+# would also redirect, but only without the .git suffix).
+RAW_URL="${AGENTHQ_RAW_URL:-https://raw.githubusercontent.com/gumdrop-source/AgentHQ}"
+
 # Elevate to root if not already
 if [[ $EUID -ne 0 ]]; then
     echo "[AgentHQ] Re-running under sudo..."
     exec sudo -E env \
         AGENTHQ_REPO_URL="$REPO_URL" \
+        AGENTHQ_RAW_URL="$RAW_URL" \
         AGENTHQ_REPO_REF="$REPO_REF" \
         AGENTHQ_INSTALL_DIR="$INSTALL_DIR" \
         AGENTHQ_LOCAL_SUBNET="${AGENTHQ_LOCAL_SUBNET:-}" \
-        bash -c "curl -fsSL $REPO_URL/raw/$REPO_REF/install.sh | bash"
+        bash -c "curl -fsSL $RAW_URL/$REPO_REF/install.sh | bash"
 fi
 
 # OS gate
