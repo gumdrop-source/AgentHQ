@@ -309,10 +309,161 @@ app.get("/", (c) => {
 
 // Placeholder section pages — sketch the future shape
 
-app.get("/integrations", (c) => c.html(layout("Integrations", card(`
-    ${pageHeader("Integrations", "Activate the tools your agents can use.")}
-    <p class="text-slate-600">M365, Gmail, MYOB, Xero, Hikvision, Home Assistant, PayPal, Vapi, Twilio…</p>
-    <p class="mt-3 text-sm text-slate-500"><em>Coming soon.</em> Each integration will have a guided setup wizard — instructions for registering the external service, prompts for credentials, validation, and one-click activation. Once activated, every agent on this host has access to it.</p>
+// Read all available integration manifests from /opt/agents/tools/<id>/tool.json
+function listIntegrations(): Array<{
+    id: string;
+    title: string;
+    description: string;
+    tools: string[];
+    credentialsCount: number;
+    active: boolean;
+}> {
+    const toolsDir = process.env.AGENTHQ_TOOLS_DIR ?? "/opt/agents/tools";
+    if (!existsSync(toolsDir)) return [];
+    const out: any[] = [];
+    for (const id of readdirSync(toolsDir)) {
+        if (id.startsWith("_")) continue;  // _format, _example, etc.
+        const manifestPath = `${toolsDir}/${id}/tool.json`;
+        if (!existsSync(manifestPath)) continue;
+        try {
+            const m = JSON.parse(readFileSync(manifestPath, "utf8"));
+            // Active = at least the first credential exists in the vault
+            const firstCred = m.credentials?.[0]?.key;
+            const active = firstCred
+                ? existsSync(`/etc/agents/credentials/${firstCred}.cred`)
+                : true;
+            out.push({
+                id: m.name ?? id,
+                title: m.title ?? id,
+                description: m.description ?? "",
+                tools: Object.keys(m.tools ?? {}),
+                credentialsCount: (m.credentials ?? []).length,
+                active,
+            });
+        } catch {}
+    }
+    return out.sort((a, b) => a.title.localeCompare(b.title));
+}
+
+app.get("/integrations", (c) => {
+    const integrations = listIntegrations();
+    const cards = integrations.length === 0
+        ? `<p class="text-slate-500 italic">No integrations available yet. Tool manifests live under <code>/opt/agents/tools/&lt;name&gt;/tool.json</code>.</p>`
+        : integrations.map((it) => `
+            <div class="bg-white rounded-xl border border-slate-200 p-5">
+              <div class="flex items-start justify-between gap-3 mb-2">
+                <div>
+                  <h3 class="font-medium text-base">${escapeHtml(it.title)}</h3>
+                  <p class="text-xs text-slate-500 font-mono">${escapeHtml(it.id)}</p>
+                </div>
+                ${it.active
+                    ? `<span class="inline-flex items-center gap-1.5 text-xs text-emerald-700 bg-emerald-50 px-2 py-1 rounded"><span class="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>Active</span>`
+                    : `<span class="inline-flex items-center gap-1.5 text-xs text-slate-500 bg-slate-100 px-2 py-1 rounded"><span class="w-1.5 h-1.5 rounded-full bg-slate-400"></span>Inactive</span>`
+                }
+              </div>
+              <p class="text-sm text-slate-600 mb-3">${escapeHtml(it.description)}</p>
+              <p class="text-xs text-slate-500 mb-3">${it.tools.length} tool${it.tools.length === 1 ? "" : "s"} · ${it.credentialsCount} credential${it.credentialsCount === 1 ? "" : "s"} required</p>
+              <div class="flex gap-2">
+                <a href="/integrations/${encodeURIComponent(it.id)}" class="inline-block px-3 py-1.5 rounded-lg font-medium text-sm bg-slate-100 text-slate-900 hover:bg-slate-200">Details</a>
+                ${it.active
+                    ? `<a href="/integrations/${encodeURIComponent(it.id)}/configure" class="inline-block px-3 py-1.5 rounded-lg font-medium text-sm bg-slate-100 text-slate-900 hover:bg-slate-200">Configure</a>`
+                    : `<a href="/integrations/${encodeURIComponent(it.id)}/activate" class="inline-block px-3 py-1.5 rounded-lg font-medium text-sm bg-slate-900 text-white hover:bg-slate-700">Activate</a>`
+                }
+              </div>
+            </div>
+        `).join("");
+
+    return c.html(layout("Integrations", `
+        <div class="mb-6">
+          <h1 class="text-2xl font-semibold tracking-tight">Integrations</h1>
+          <p class="text-slate-600 text-sm">External services your agents can connect to. Activate one to make it available across all agents.</p>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">${cards}</div>
+        <p class="text-xs text-slate-500 mt-6">
+          Adding more integrations: drop a new <code>tool.json</code> manifest into
+          <code>/opt/agents/tools/&lt;name&gt;/</code>. The platform discovers it on
+          next page load. Schema in <code>tools/_format/README.md</code>.
+        </p>
+    `, "integrations", c.get("user")));
+});
+
+// Per-integration detail page — shows the full manifest + setup.md
+app.get("/integrations/:id", (c) => {
+    const id = c.req.param("id");
+    if (!/^[a-z][a-z0-9_-]*$/.test(id)) return c.html(errorPage("Invalid integration id"));
+    const toolsDir = process.env.AGENTHQ_TOOLS_DIR ?? "/opt/agents/tools";
+    const manifestPath = `${toolsDir}/${id}/tool.json`;
+    if (!existsSync(manifestPath)) return c.html(errorPage(`No such integration: ${id}`));
+    let m: any;
+    try { m = JSON.parse(readFileSync(manifestPath, "utf8")); } catch { return c.html(errorPage("Manifest invalid")); }
+
+    const setupPath = `${toolsDir}/${id}/setup.md`;
+    const setup = existsSync(setupPath) ? readFileSync(setupPath, "utf8") : "";
+    const firstCred = m.credentials?.[0]?.key;
+    const active = firstCred ? existsSync(`/etc/agents/credentials/${firstCred}.cred`) : true;
+
+    const toolRows = Object.entries<any>(m.tools ?? {}).map(([name, meta]) => `
+        <tr class="border-b border-slate-100 last:border-0">
+          <td class="py-2 pr-4 font-mono text-sm">${escapeHtml(name)}</td>
+          <td class="py-2 text-sm text-slate-600">${escapeHtml(meta.description ?? "")}</td>
+          <td class="py-2 text-right">${meta.destructive ? `<span class="text-xs text-rose-600">⚠ destructive</span>` : ""}</td>
+        </tr>`).join("");
+
+    const credRows = (m.credentials ?? []).map((c: any) => `
+        <tr class="border-b border-slate-100 last:border-0">
+          <td class="py-2 pr-4 font-mono text-sm">${escapeHtml(c.key)}</td>
+          <td class="py-2 text-sm">${escapeHtml(c.label ?? "")}</td>
+          <td class="py-2 text-xs text-slate-500">${c.secret ? "secret" : ""}</td>
+        </tr>`).join("");
+
+    return c.html(layout(m.title ?? id, `
+        <div class="flex items-baseline justify-between mb-6">
+          <div>
+            <h1 class="text-2xl font-semibold tracking-tight">${escapeHtml(m.title ?? id)}</h1>
+            <p class="text-slate-500 text-sm font-mono">${escapeHtml(id)}</p>
+          </div>
+          ${active
+            ? `<a href="/integrations/${id}/configure" class="inline-block px-4 py-2 rounded-lg font-medium bg-slate-100 text-slate-900 hover:bg-slate-200">Configure</a>`
+            : `<a href="/integrations/${id}/activate" class="inline-block px-4 py-2 rounded-lg font-medium bg-slate-900 text-white hover:bg-slate-700">Activate</a>`
+          }
+        </div>
+        ${card(`
+          <p class="text-slate-700 mb-4">${escapeHtml(m.description ?? "")}</p>
+
+          <h3 class="font-medium mt-4 mb-2">Tools (${Object.keys(m.tools ?? {}).length})</h3>
+          <table class="w-full text-left">
+            <thead><tr class="text-xs text-slate-500 uppercase border-b border-slate-200"><th class="pr-4 pb-2">Name</th><th class="pb-2">Description</th><th></th></tr></thead>
+            <tbody>${toolRows}</tbody>
+          </table>
+
+          <h3 class="font-medium mt-6 mb-2">Required credentials (${(m.credentials ?? []).length})</h3>
+          <table class="w-full text-left">
+            <thead><tr class="text-xs text-slate-500 uppercase border-b border-slate-200"><th class="pr-4 pb-2">Key</th><th class="pb-2">Label</th><th class="pb-2"></th></tr></thead>
+            <tbody>${credRows}</tbody>
+          </table>
+        `)}
+        ${setup ? `
+          <div class="mt-6 bg-white rounded-xl border border-slate-200 p-6">
+            <h3 class="font-medium mb-3">Setup instructions</h3>
+            <pre class="whitespace-pre-wrap text-sm text-slate-700">${escapeHtml(setup)}</pre>
+          </div>` : ""}
+        <div class="mt-4">${button("Back to integrations", { href: "/integrations", intent: "secondary" })}</div>
+    `, "integrations", c.get("user")));
+});
+
+// TODO: GET /integrations/:id/activate — credential paste form
+// TODO: POST /integrations/:id/activate — agenthq-cred set + validation + mcp_servers row
+// TODO: GET /integrations/:id/configure — show stored creds (masked) + tool list + edit + deactivate
+app.get("/integrations/:id/activate", (c) => c.html(layout("Activate", card(`
+    ${pageHeader(`Activate ${escapeHtml(c.req.param("id"))}`, "Coming soon — paste credentials, validate, store in vault.")}
+    <p class="text-sm text-slate-500">For now, activate via CLI on the host:<br>
+       <code>sudo agenthq-cred set ${escapeHtml(c.req.param("id"))}_tenant_id</code> (etc, one per credential listed on the integration's detail page).</p>
+    <div class="mt-4">${button("Back", { href: `/integrations/${c.req.param("id")}`, intent: "secondary" })}</div>
+`), "integrations", c.get("user"))));
+
+app.get("/integrations/:id/configure", (c) => c.html(layout("Configure", card(`
+    ${pageHeader(`Configure ${escapeHtml(c.req.param("id"))}`, "Coming soon — view/rotate credentials, deactivate.")}
+    <div class="mt-4">${button("Back", { href: `/integrations/${c.req.param("id")}`, intent: "secondary" })}</div>
 `), "integrations", c.get("user"))));
 
 app.get("/updates", (c) => c.html(layout("Updates", card(`
