@@ -247,7 +247,9 @@ app.get("/setup/claude/:name", (c) => {
                    ${code(`sudo -i -u ${name} claude`)}
                  </li>
                  <li>Inside claude, type <code class="bg-slate-100 px-1 rounded">/login</code> and pick "Claude.ai login"</li>
-                 <li>Claude prints a URL — open it in a browser, sign in to your Anthropic account, paste the code back</li>
+                 <li>Claude prints a URL. <strong>Press <code class="bg-slate-100 px-1 rounded">c</code> to copy it</strong> (the URL wraps over several lines in the terminal — copying via <code>c</code> grabs the full URL regardless)</li>
+                 <li>Open a browser, paste the URL, sign in to your Anthropic account</li>
+                 <li>Browser redirects you with a code — copy it, paste into the "Paste code here if prompted" field in the terminal, hit Enter</li>
                  <li>Type <code class="bg-slate-100 px-1 rounded">/exit</code> to leave claude</li>
                </ol>
                <p class="text-sm text-slate-500">This page auto-refreshes every few seconds…</p>
