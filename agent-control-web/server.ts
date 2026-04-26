@@ -8,29 +8,63 @@
 
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
+import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 
-const app = new Hono();
+import {
+    userCount, userByEmail, userBySession, createUser, verifyPassword,
+    createSession, destroySession,
+    type User,
+} from "./db.ts";
+
+const app = new Hono<{ Variables: { user: User | null } }>();
 const PORT = Number(process.env.PORT ?? 5000);
+const SESSION_COOKIE = "agentctl_session";
+
+// ─── auth ─────────────────────────────────────────────────────────────────
+
+// Public routes (no auth required). Everything else needs a logged-in user.
+const PUBLIC_PATHS = new Set(["/login", "/signup", "/logout"]);
+
+app.use("*", async (c, next) => {
+    const session = getCookie(c, SESSION_COOKIE);
+    const user = session ? userBySession(session) : null;
+    c.set("user", user);
+
+    const path = c.req.path;
+    if (PUBLIC_PATHS.has(path) || path.startsWith("/static/")) {
+        return next();
+    }
+    if (user) return next();
+
+    // First-run: empty user table → kick everyone to signup
+    if (userCount() === 0) return c.redirect("/signup");
+    return c.redirect("/login");
+});
 
 // ─── HTML helpers ─────────────────────────────────────────────────────────
 
 type NavKey = "agents" | "integrations" | "updates" | "settings" | null;
 
-const layout = (title: string, body: string, active: NavKey = null) => {
+const layout = (title: string, body: string, active: NavKey = null, user: User | null = null) => {
     const navItem = (key: Exclude<NavKey, null>, label: string, href: string) => {
         const cls = active === key
             ? "px-3 py-1.5 rounded-md text-sm font-medium bg-slate-900 text-white"
             : "px-3 py-1.5 rounded-md text-sm font-medium text-slate-600 hover:text-slate-900";
         return `<a href="${href}" class="${cls}">${label}</a>`;
     };
+    const userBlock = user ? `
+        <div class="flex items-center gap-3 text-sm">
+          <span class="text-slate-600">${escapeHtml(user.display_name)}${user.role === "admin" ? ` <span class="ml-1 px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 text-xs">admin</span>` : ""}</span>
+          <a href="/logout" class="text-slate-500 hover:text-slate-900">Sign out</a>
+        </div>` : "";
     return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>${title} · AgentHQ</title>
+  <title>${title} · Agent Control</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/htmx.org@2.0.4" integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+" crossorigin="anonymous"></script>
   <script src="https://unpkg.com/htmx-ext-sse@2.2.2/sse.js"></script>
@@ -49,6 +83,7 @@ const layout = (title: string, body: string, active: NavKey = null) => {
         ${navItem("updates", "Updates", "/updates")}
         ${navItem("settings", "Settings", "/settings")}
       </nav>
+      ${userBlock}
     </div>
   </header>
   <main class="max-w-5xl mx-auto px-6 py-8">
@@ -103,6 +138,117 @@ function claudeAuthenticated(name: string): boolean {
 
 // ─── routes ───────────────────────────────────────────────────────────────
 
+// ─── auth routes ──────────────────────────────────────────────────────────
+
+const authPage = (title: string, body: string) => `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title} · Agent Control</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>body{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}</style>
+</head><body class="bg-slate-50 text-slate-900 min-h-screen flex items-center justify-center">
+  <div class="w-full max-w-sm p-8 bg-white rounded-xl shadow-sm border border-slate-200">
+    <h1 class="text-xl font-semibold tracking-tight mb-1">Agent Control</h1>
+    ${body}
+  </div>
+</body></html>`;
+
+app.get("/signup", (c) => {
+    // Only the first-admin signup is allowed without auth. After that, signup
+    // is gated to admins (handled in /admin/users — TODO).
+    if (userCount() > 0) return c.redirect("/login");
+    return c.html(authPage("Create admin", `
+        <p class="text-sm text-slate-600 mb-6">First-time setup. This account becomes the AgentHQ admin.</p>
+        <form method="POST" action="/signup" class="space-y-4">
+          <div>
+            <label class="block text-xs font-medium mb-1 text-slate-700">Display name</label>
+            <input name="display_name" required class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">
+          </div>
+          <div>
+            <label class="block text-xs font-medium mb-1 text-slate-700">Email</label>
+            <input name="email" type="email" required class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">
+          </div>
+          <div>
+            <label class="block text-xs font-medium mb-1 text-slate-700">Password</label>
+            <input name="password" type="password" required minlength="8" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">
+            <p class="text-xs text-slate-400 mt-1">8+ chars. Stored hashed (argon2id).</p>
+          </div>
+          <button type="submit" class="w-full bg-slate-900 text-white px-4 py-2 rounded-lg font-medium">Create admin</button>
+        </form>
+    `));
+});
+
+app.post("/signup", async (c) => {
+    if (userCount() > 0) return c.redirect("/login");
+    const body = await c.req.parseBody();
+    const email = String(body.email ?? "").trim();
+    const password = String(body.password ?? "");
+    const displayName = String(body.display_name ?? "").trim();
+    if (!email || password.length < 8 || !displayName) {
+        return c.html(authPage("Sign up", `<p class="text-rose-600 text-sm mb-3">Missing or invalid input.</p><a href="/signup" class="underline">Back</a>`));
+    }
+    const id = await createUser(email, password, displayName, "admin");
+    const session = createSession(id);
+    setCookie(c, SESSION_COOKIE, session, {
+        httpOnly: true, sameSite: "Lax", path: "/",
+        maxAge: 30 * 86400,
+    });
+    return c.redirect("/");
+});
+
+app.get("/login", (c) => {
+    if (userCount() === 0) return c.redirect("/signup");
+    return c.html(authPage("Sign in", `
+        <p class="text-sm text-slate-600 mb-6">Sign in to manage your agents.</p>
+        <form method="POST" action="/login" class="space-y-4">
+          <div>
+            <label class="block text-xs font-medium mb-1 text-slate-700">Email</label>
+            <input name="email" type="email" required autofocus class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">
+          </div>
+          <div>
+            <label class="block text-xs font-medium mb-1 text-slate-700">Password</label>
+            <input name="password" type="password" required class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">
+          </div>
+          <button type="submit" class="w-full bg-slate-900 text-white px-4 py-2 rounded-lg font-medium">Sign in</button>
+        </form>
+    `));
+});
+
+app.post("/login", async (c) => {
+    const body = await c.req.parseBody();
+    const email = String(body.email ?? "").trim().toLowerCase();
+    const password = String(body.password ?? "");
+    const user = userByEmail(email);
+    const ok = user && await verifyPassword(user, password);
+    if (!ok || !user) {
+        return c.html(authPage("Sign in", `
+            <p class="text-rose-600 text-sm mb-3">Wrong email or password.</p>
+            <a href="/login" class="underline">Try again</a>`));
+    }
+    const session = createSession(user.id);
+    setCookie(c, SESSION_COOKIE, session, {
+        httpOnly: true, sameSite: "Lax", path: "/",
+        maxAge: 30 * 86400,
+    });
+    return c.redirect("/");
+});
+
+app.post("/logout", (c) => {
+    const session = getCookie(c, SESSION_COOKIE);
+    if (session) destroySession(session);
+    deleteCookie(c, SESSION_COOKIE, { path: "/" });
+    return c.redirect("/login");
+});
+
+app.get("/logout", (c) => {
+    // Convenience GET so a link works
+    const session = getCookie(c, SESSION_COOKIE);
+    if (session) destroySession(session);
+    deleteCookie(c, SESSION_COOKIE, { path: "/" });
+    return c.redirect("/login");
+});
+
+// ─── routes ───────────────────────────────────────────────────────────────
+
 app.get("/", (c) => {
     const agents = listAgents();
 
@@ -124,7 +270,7 @@ app.get("/", (c) => {
                 ${button("Create your first agent", { href: "/setup/agent" })}
               </div>
             </div>
-        `), "agents"));
+        `), "agents", c.get("user")));
     }
 
     // Dashboard: 1+ agents — persistent control surface.
@@ -153,7 +299,7 @@ app.get("/", (c) => {
         ${card(`
           <div class="space-y-2">${agentRows}</div>
         `)}
-    `, "agents"));
+    `, "agents", c.get("user")));
 });
 
 // Placeholder section pages — sketch the future shape
@@ -162,19 +308,19 @@ app.get("/integrations", (c) => c.html(layout("Integrations", card(`
     ${pageHeader("Integrations", "Activate the tools your agents can use.")}
     <p class="text-slate-600">M365, Gmail, MYOB, Xero, Hikvision, Home Assistant, PayPal, Vapi, Twilio…</p>
     <p class="mt-3 text-sm text-slate-500"><em>Coming soon.</em> Each integration will have a guided setup wizard — instructions for registering the external service, prompts for credentials, validation, and one-click activation. Once activated, every agent on this host has access to it.</p>
-`), "integrations")));
+`), "integrations", c.get("user"))));
 
 app.get("/updates", (c) => c.html(layout("Updates", card(`
     ${pageHeader("Updates", "Keep the platform and the claude binary current.")}
     <p class="text-slate-600">AgentHQ checks for new commits on <code>main</code> and new claude versions from Anthropic.</p>
     <p class="mt-3 text-sm text-slate-500"><em>Coming soon.</em> One-click "Update now" + a nightly background timer that pulls fresh code, runs <code>install.sh</code> idempotently, and gracefully restarts services.</p>
-`), "updates")));
+`), "updates", c.get("user"))));
 
 app.get("/settings", (c) => c.html(layout("Settings", card(`
     ${pageHeader("Settings", "Host-level configuration.")}
     <p class="text-slate-600">Telegram defaults, log level, backup path, host nickname, vault method (TPM2/host-key)…</p>
     <p class="mt-3 text-sm text-slate-500"><em>Coming soon.</em></p>
-`), "settings")));
+`), "settings", c.get("user"))));
 
 app.get("/setup/agent", (c) => {
     return c.html(layout("Add agent", card(`
@@ -202,7 +348,7 @@ app.get("/setup/agent", (c) => {
             ${button("Cancel", { href: "/", intent: "secondary" })}
           </div>
         </form>
-    `)));
+    `), null, c.get("user")));
 });
 
 app.post("/setup/agent", async (c) => {
@@ -233,7 +379,7 @@ app.post("/setup/agent", async (c) => {
             When provisioning completes, the next step is Claude OAuth login.
           </div>
         </div>
-    `), "agents"));
+    `), "agents", c.get("user")));
 });
 
 // SSE stream for agent-control output. Emits "line" events for each chunk
@@ -315,7 +461,7 @@ app.get("/setup/claude/:name", (c) => {
                </ol>
                <p class="text-sm text-slate-500">This page auto-refreshes every few seconds…</p>
                <script>setTimeout(() => location.reload(), 4000)</script>`}
-    `)));
+    `), null, c.get("user")));
 });
 
 app.get("/setup/token/:name", (c) => {
@@ -338,7 +484,7 @@ app.get("/setup/token/:name", (c) => {
             ${button("Cancel", { href: "/", intent: "secondary" })}
           </div>
         </form>
-    `)));
+    `), null, c.get("user")));
 });
 
 app.post("/setup/token/:name", async (c) => {
@@ -381,7 +527,7 @@ app.get("/agent/:name", (c) => {
           ${code(r.stdout || r.stderr)}
           <p class="mt-4 text-sm text-slate-600">If status is <code>active (running)</code>, message your bot in Telegram. It should reply.</p>
         `)}
-    `, "agents"));
+    `, "agents", c.get("user")));
 });
 
 // Permissions matrix: read-only first cut. Reads the agent's settings.json
@@ -521,7 +667,7 @@ app.get("/agent/:name/permissions", (c) => {
           Editable matrix coming soon. For now this is read-only —
           edit <code>/home/${escapeHtml(name)}/.claude/settings.json</code> directly and restart the service.
         </p>
-    `, "agents"));
+    `, "agents", c.get("user")));
 });
 
 function errorPage(title: string, detail = ""): string {
