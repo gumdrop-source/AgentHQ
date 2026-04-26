@@ -10,11 +10,12 @@ of them to an agent happens in the per-agent Permissions matrix.
 
 from __future__ import annotations
 
-import os
+import functools
 import json
+import os
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import msal
 import requests
@@ -91,20 +92,100 @@ def _save_cache() -> None:
             pass
 
 
+PENDING_FLOW_FILE = HOME / ".m365_pending_flow.json"
+
+
+class AuthRequired(Exception):
+    """Raised by _token() when the user needs to complete a device-flow sign-in.
+
+    Tools should catch this (or use @requires_auth) and return a structured
+    response containing the URL + user code. The agent (LLM) sees the
+    response and relays it to the human user via Telegram. The user signs
+    in in their browser, comes back, asks again — _token() then completes
+    the pending flow on the second invocation.
+    """
+
+    def __init__(self, verification_uri: str, user_code: str) -> None:
+        self.verification_uri = verification_uri
+        self.user_code = user_code
+        super().__init__(f"Sign-in required: open {verification_uri}, enter {user_code}")
+
+
+def _try_complete_pending_flow() -> str | None:
+    """If a device flow is pending, poll once. Return access_token on success,
+    None if not yet authorized, raise AuthRequired if still waiting."""
+    if not PENDING_FLOW_FILE.exists():
+        return None
+    try:
+        flow = json.loads(PENDING_FLOW_FILE.read_text())
+    except Exception:
+        PENDING_FLOW_FILE.unlink(missing_ok=True)
+        return None
+
+    # One-shot poll: msal's acquire_token_by_device_flow blocks unless we
+    # exit early. exit_condition is called between polls; returning True
+    # bails out with whatever the latest result is.
+    attempts = {"n": 0}
+    def one_poll(_flow):
+        attempts["n"] += 1
+        return attempts["n"] >= 1
+
+    try:
+        result = _app.acquire_token_by_device_flow(flow, exit_condition=one_poll)
+    except Exception:
+        PENDING_FLOW_FILE.unlink(missing_ok=True)
+        return None
+
+    if "access_token" in result:
+        _save_cache()
+        PENDING_FLOW_FILE.unlink(missing_ok=True)
+        return result["access_token"]
+
+    # Still waiting on user. Re-surface the URL+code so the agent prompts again.
+    raise AuthRequired(flow.get("verification_uri", ""), flow.get("user_code", ""))
+
+
 def _token() -> str:
+    # 1. Try silent refresh from cached account
     accounts = _app.get_accounts()
-    if not accounts:
-        raise RuntimeError(
-            "No cached account. Run device-flow sign-in via "
-            "`python -m m365.auth` (or the AgentHQ Integrations tab → m365 → Refresh)."
-        )
-    result = _app.acquire_token_silent(SCOPES, account=accounts[0])
-    if not result or "access_token" not in result:
-        raise RuntimeError(
-            f"Refresh failed: {result}. Re-run device-flow sign-in."
-        )
-    _save_cache()
-    return result["access_token"]
+    if accounts:
+        result = _app.acquire_token_silent(SCOPES, account=accounts[0])
+        if result and "access_token" in result:
+            _save_cache()
+            return result["access_token"]
+
+    # 2. If a device flow is pending, attempt to complete it
+    completed = _try_complete_pending_flow()
+    if completed:
+        return completed
+
+    # 3. No cached account, no pending flow — start a new device flow
+    flow = _app.initiate_device_flow(scopes=SCOPES)
+    if "user_code" not in flow:
+        raise RuntimeError(f"Failed to start device flow: {flow}")
+    PENDING_FLOW_FILE.write_text(json.dumps(flow))
+    raise AuthRequired(flow["verification_uri"], flow["user_code"])
+
+
+def requires_auth(fn: Callable) -> Callable:
+    """Decorator: catch AuthRequired and return a structured response that
+    instructs the agent to relay the sign-in URL+code to the user."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except AuthRequired as e:
+            return {
+                "auth_required": True,
+                "message": (
+                    f"To do that I need access to your Microsoft 365. "
+                    f"Open {e.verification_uri} in a browser and enter the code {e.user_code}. "
+                    f"Sign in with your Microsoft account, then ask me again."
+                ),
+                "verification_uri": e.verification_uri,
+                "user_code": e.user_code,
+            }
+    return wrapper
 
 
 def _graph_get(path: str, params: dict[str, Any] | None = None) -> dict:
@@ -146,6 +227,7 @@ mcp = FastMCP(
 
 
 @mcp.tool()
+@requires_auth
 def outlook_email_search(
     query: str = "",
     folder: str = "inbox",
@@ -185,6 +267,7 @@ def outlook_email_search(
 
 
 @mcp.tool()
+@requires_auth
 def outlook_email_read(message_id: str) -> dict:
     """Read one email's full content by message ID."""
     m = _graph_get(f"/me/messages/{message_id}")
@@ -202,6 +285,7 @@ def outlook_email_read(message_id: str) -> dict:
 
 
 @mcp.tool()
+@requires_auth
 def outlook_email_draft(to: list[str], subject: str, body: str, cc: list[str] | None = None) -> dict:
     """Create a draft email. Does NOT send. Returns the draft's ID."""
     payload = {
@@ -215,12 +299,14 @@ def outlook_email_draft(to: list[str], subject: str, body: str, cc: list[str] | 
 
 
 @mcp.tool()
+@requires_auth
 def outlook_email_archive(message_id: str) -> dict:
     """Move a message from Inbox to Archive."""
     return _graph_post(f"/me/messages/{message_id}/move", {"destinationId": "archive"})
 
 
 @mcp.tool()
+@requires_auth
 def outlook_email_send(message_id: str | None = None, to: list[str] | None = None,
                        subject: str | None = None, body: str | None = None) -> dict:
     """Send an email — either an existing draft (by ID) or a new one inline.
