@@ -4,9 +4,20 @@ Multi-tenant Claude Code agent platform for Ubuntu.
 
 ## Install
 
+Requires Ubuntu 24.04+ with `curl` available. On a fresh Ubuntu Desktop
+install you'll need to install curl first:
+
+```sh
+sudo apt install -y curl
+```
+
+Then run:
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/gumdrop-source/AgentHQ/main/install.sh | bash
 ```
+
+The installer will elevate to sudo automatically and run all phases.
 
 Then provision your first agent:
 
