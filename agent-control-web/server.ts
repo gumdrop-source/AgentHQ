@@ -85,35 +85,67 @@ function claudeAuthenticated(name: string): boolean {
 
 app.get("/", (c) => {
     const agents = listAgents();
-    const agentList = agents.length === 0
-        ? `<p class="text-slate-500 italic">No agents yet.</p>`
-        : `<ul class="space-y-2">${agents.map((a) => `
-            <li class="flex items-center justify-between border-b border-slate-100 last:border-0 pb-2">
-              <span class="font-mono">${escapeHtml(a.name)}</span>
-              <span class="text-sm ${a.status === "active" ? "text-emerald-600" : "text-slate-500"}">${escapeHtml(a.status)}</span>
-            </li>`).join("")}</ul>`;
 
-    return c.html(layout("Welcome", card(`
-        ${pageHeader("Welcome to AgentHQ", "The platform is installed. Now provision your first agent.")}
-        <div class="space-y-6">
-          <section>
-            <h2 class="font-medium mb-2">What's next</h2>
-            <ol class="list-decimal list-inside text-slate-700 space-y-1">
-              <li>Create an agent (Linux user + claude install + config)</li>
-              <li>Sign in to your Anthropic account so the agent can call the API</li>
-              <li>Drop in a Telegram bot token so it can talk to you</li>
-              <li>Send a test message — confirm end to end</li>
-            </ol>
-          </section>
-          <section>
-            <h2 class="font-medium mb-2">Existing agents</h2>
-            ${agentList}
-          </section>
-          <div class="pt-2">
-            ${button("Create your first agent", { href: "/setup/agent" })}
+    // Empty state: wizard-style welcome + "create your first agent" CTA.
+    if (agents.length === 0) {
+        return c.html(layout("Welcome", card(`
+            ${pageHeader("Welcome to AgentHQ", "The platform is installed. Now provision your first agent.")}
+            <div class="space-y-6">
+              <section>
+                <h2 class="font-medium mb-2">What's next</h2>
+                <ol class="list-decimal list-inside text-slate-700 space-y-1">
+                  <li>Create an agent (Linux user + claude install + config)</li>
+                  <li>Sign in to your Anthropic account so the agent can call the API</li>
+                  <li>Drop in a Telegram bot token so it can talk to you</li>
+                  <li>Send a test message — confirm end to end</li>
+                </ol>
+              </section>
+              <div class="pt-2">
+                ${button("Create your first agent", { href: "/setup/agent" })}
+              </div>
+            </div>
+        `)));
+    }
+
+    // Dashboard: 1+ agents — persistent control surface.
+    const agentRows = agents.map((a) => {
+        const dot = a.status === "active" ? "bg-emerald-500" : "bg-slate-300";
+        return `
+            <a href="/agent/${encodeURIComponent(a.name)}"
+               class="flex items-center justify-between p-4 rounded-lg border border-slate-200 hover:border-slate-400 transition">
+              <div class="flex items-center gap-3">
+                <span class="w-2.5 h-2.5 rounded-full ${dot}"></span>
+                <span class="font-mono font-medium">${escapeHtml(a.name)}</span>
+              </div>
+              <span class="text-sm text-slate-500">${escapeHtml(a.status)}</span>
+            </a>`;
+    }).join("");
+
+    return c.html(layout("Dashboard", `
+        <div class="flex items-center justify-between mb-6">
+          <div>
+            <h1 class="text-2xl font-semibold tracking-tight">Dashboard</h1>
+            <p class="text-slate-600 text-sm">${agents.length} agent${agents.length === 1 ? "" : "s"} on this host</p>
+          </div>
+          ${button("+ Add agent", { href: "/setup/agent" })}
+        </div>
+
+        ${card(`
+          <h2 class="font-medium mb-3 text-slate-700">Agents</h2>
+          <div class="space-y-2">${agentRows}</div>
+        `)}
+
+        <div class="mt-6 grid grid-cols-2 gap-4">
+          <div class="bg-white rounded-xl border border-slate-200 p-6 opacity-60">
+            <h3 class="font-medium mb-1">Integrations</h3>
+            <p class="text-sm text-slate-600">Activate M365, Gmail, MYOB, Hikvision, etc. <em>Coming soon.</em></p>
+          </div>
+          <div class="bg-white rounded-xl border border-slate-200 p-6 opacity-60">
+            <h3 class="font-medium mb-1">Updates</h3>
+            <p class="text-sm text-slate-600">Pull the latest AgentHQ + claude binary. <em>Coming soon.</em></p>
           </div>
         </div>
-    `)));
+    `));
 });
 
 app.get("/setup/agent", (c) => {
@@ -311,7 +343,7 @@ app.get("/agent/:name", (c) => {
         <p class="mt-4 text-sm text-slate-600">If status is <code>active (running)</code>, message your bot in Telegram. It should reply.</p>
         <div class="mt-4 flex gap-3">
           ${button("Refresh", { href: `/agent/${name}`, intent: "secondary" })}
-          ${button("Back to dashboard", { href: "/", intent: "secondary" })}
+          ${button("Back to dashboard", { href: "/" })}
         </div>
     `)));
 });
