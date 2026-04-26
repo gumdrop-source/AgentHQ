@@ -20,7 +20,10 @@ agent="${1:-${USER:-}}"
 log() { echo "[agent-prelaunch:$agent] $*"; }
 
 # 1. Telegram plugin .env
-tg_token_cred="${CREDENTIALS_DIRECTORY:-}/telegram_bot_token"
+# Per-agent credentials use the agent-prefixed name end-to-end (filename,
+# encrypted name, runtime name) because systemd-creds refuses to load if
+# the runtime name doesn't match the embedded one.
+tg_token_cred="${CREDENTIALS_DIRECTORY:-}/${agent}_telegram_bot_token"
 if [[ -r "$tg_token_cred" ]]; then
     tg_dir="$HOME/.claude/channels/telegram"
     install -d -m 0700 "$tg_dir"

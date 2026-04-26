@@ -77,8 +77,12 @@ write_credentials_dropin() {
     echo "# Regenerate by re-running: agent-control create $name --tools $tools"
     echo "[Service]"
 
+    # systemd-creds embeds the credential name when encrypting and refuses to
+    # load if the runtime name mismatches the embedded one. So runtime name
+    # must equal the name used at `agenthq-cred set` time, which equals the
+    # filename. Per-agent creds therefore use the agent-prefixed name end-to-end.
     if [[ ",$tools," == *,telegram,* ]]; then
-        echo "LoadCredentialEncrypted=telegram_bot_token:$CRED_VAULT/${name}_telegram_bot_token.cred"
+        echo "LoadCredentialEncrypted=${name}_telegram_bot_token:$CRED_VAULT/${name}_telegram_bot_token.cred"
     fi
     if [[ ",$tools," == *,m365,* ]]; then
         echo "LoadCredentialEncrypted=m365_tenant_id:$CRED_VAULT/m365_tenant_id.cred"
@@ -86,8 +90,8 @@ write_credentials_dropin() {
         echo "LoadCredentialEncrypted=m365_client_secret:$CRED_VAULT/m365_client_secret.cred"
     fi
     if [[ ",$tools," == *,gmail,* ]]; then
-        echo "LoadCredentialEncrypted=gmail_user:$CRED_VAULT/${name}_gmail_user.cred"
-        echo "LoadCredentialEncrypted=gmail_pass:$CRED_VAULT/${name}_gmail_pass.cred"
+        echo "LoadCredentialEncrypted=${name}_gmail_user:$CRED_VAULT/${name}_gmail_user.cred"
+        echo "LoadCredentialEncrypted=${name}_gmail_pass:$CRED_VAULT/${name}_gmail_pass.cred"
     fi
     if [[ ",$tools," == *,myob,* ]]; then
         echo "LoadCredentialEncrypted=myob_client_id:$CRED_VAULT/myob_client_id.cred"
