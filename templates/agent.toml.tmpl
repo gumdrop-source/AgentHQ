@@ -14,3 +14,17 @@ bot_token_cred = "{{AGENT_NAME}}_telegram_bot_token"
 [tools]
 # Tools this agent is allowed to invoke. Must each exist under /opt/agents/tools/.
 enabled = {{TOOLS_LIST_TOML}}
+
+# Per-tool permissions. Edit via /agent/<name>/permissions in the web UI,
+# or in this file directly (then restart agent@<name>.service).
+#
+# Format per MCP server:
+#   server_name = "*"             grant ALL of this server's tools
+#   server_name = ["a", "b"]      grant only listed tools
+#   server_name not present       deny the whole server
+#
+# Built-in plugins (telegram, claude-mem) are always granted — they're
+# how the agent talks to you and remembers things.
+[permissions]
+# myob = ["accounts", "bank_balance"]
+# m365 = "*"

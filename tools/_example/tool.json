@@ -1,0 +1,28 @@
+{
+  "name": "example",
+  "title": "Example tool",
+  "description": "Reference manifest showing the tool.json schema. Not installed.",
+  "credentials": [
+    {
+      "key": "example_api_key",
+      "label": "API key",
+      "secret": true,
+      "description": "Generate at example.com/account/api"
+    }
+  ],
+  "tools": {
+    "list_things": {
+      "description": "Read-only list of things"
+    },
+    "get_thing": {
+      "description": "Fetch one thing by ID"
+    },
+    "create_thing": {
+      "description": "Create a new thing"
+    },
+    "delete_thing": {
+      "description": "Delete a thing",
+      "destructive": true
+    }
+  }
+}

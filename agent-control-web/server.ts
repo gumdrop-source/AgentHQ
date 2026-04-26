@@ -364,16 +364,164 @@ app.post("/setup/token/:name", async (c) => {
 
 app.get("/agent/:name", (c) => {
     const name = c.req.param("name");
+    if (!/^[a-z][a-z0-9_-]{1,30}$/.test(name)) return c.html(errorPage("Invalid agent name"));
     const r = spawnSync("systemctl", ["status", `agent@${name}.service`, "--no-pager"], { encoding: "utf8" });
-    return c.html(layout(name, card(`
-        ${pageHeader(`Agent: ${escapeHtml(name)}`)}
-        ${code(r.stdout || r.stderr)}
-        <p class="mt-4 text-sm text-slate-600">If status is <code>active (running)</code>, message your bot in Telegram. It should reply.</p>
-        <div class="mt-4 flex gap-3">
-          ${button("Refresh", { href: `/agent/${name}`, intent: "secondary" })}
-          ${button("Back to dashboard", { href: "/" })}
+    return c.html(layout(name, `
+        <div class="flex items-center justify-between mb-6">
+          <div>
+            <h1 class="text-2xl font-semibold tracking-tight">${escapeHtml(name)}</h1>
+            <p class="text-slate-600 text-sm font-mono">agent@${escapeHtml(name)}.service</p>
+          </div>
+          <div class="flex gap-2">
+            ${button("Permissions", { href: `/agent/${name}/permissions`, intent: "secondary" })}
+            ${button("Refresh", { href: `/agent/${name}`, intent: "secondary" })}
+          </div>
         </div>
-    `)));
+        ${card(`
+          ${code(r.stdout || r.stderr)}
+          <p class="mt-4 text-sm text-slate-600">If status is <code>active (running)</code>, message your bot in Telegram. It should reply.</p>
+        `)}
+    `, "agents"));
+});
+
+// Permissions matrix: read-only first cut. Reads the agent's settings.json
+// allow list, groups MCP entries by server, and decorates them with tool
+// metadata from /opt/agents/tools/<server>/tool.json (if present).
+app.get("/agent/:name/permissions", (c) => {
+    const name = c.req.param("name");
+    if (!/^[a-z][a-z0-9_-]{1,30}$/.test(name)) return c.html(errorPage("Invalid agent name"));
+
+    const settingsPath = `/home/${name}/.claude/settings.json`;
+    let allow: string[] = [];
+    try {
+        const raw = JSON.parse(readFileSync(settingsPath, "utf8"));
+        allow = (raw?.permissions?.allow ?? []) as string[];
+    } catch {
+        return c.html(errorPage(`No settings.json for ${name}`, "Agent may not exist or wasn't provisioned by AgentHQ."));
+    }
+
+    // Bucket the allow list:
+    //   builtin    Bash/Read/Write/etc — always granted, not editable
+    //   plugin     mcp__plugin_*       — always granted (telegram, claude-mem)
+    //   mcp        mcp__<server>__<tool> — per-server permissions
+    const builtins: string[] = [];
+    const plugins: Record<string, string[]> = {};
+    const mcp: Record<string, Set<string>> = {};
+    for (const entry of allow) {
+        if (!entry.startsWith("mcp__")) {
+            builtins.push(entry);
+            continue;
+        }
+        // mcp__<server>__<tool>  or  mcp__<server>__*
+        const m = entry.match(/^mcp__([^_]+(?:_[^_]+)*?)__(.+)$/);
+        if (!m) continue;
+        const [, server, tool] = m;
+        if (server.startsWith("plugin_")) {
+            plugins[server] ??= [];
+            plugins[server].push(tool);
+        } else {
+            mcp[server] ??= new Set();
+            mcp[server].add(tool);
+        }
+    }
+
+    // Load tool manifests from /opt/agents/tools/*/tool.json so the matrix
+    // shows tool descriptions, marks destructive ones, etc.
+    const manifests: Record<string, any> = {};
+    try {
+        const toolsDir = "/opt/agents/tools";
+        for (const dir of readdirSync(toolsDir)) {
+            const path = `${toolsDir}/${dir}/tool.json`;
+            if (existsSync(path)) {
+                try { manifests[dir] = JSON.parse(readFileSync(path, "utf8")); } catch {}
+            }
+        }
+    } catch {}
+
+    // Render
+    const builtinList = builtins.length === 0
+        ? `<p class="text-sm text-slate-500 italic">none</p>`
+        : `<div class="flex flex-wrap gap-1.5">${builtins.map((b) =>
+            `<span class="inline-block px-2 py-0.5 rounded bg-slate-100 text-slate-700 text-xs font-mono">${escapeHtml(b)}</span>`
+          ).join("")}</div>`;
+
+    const pluginsList = Object.keys(plugins).length === 0
+        ? `<p class="text-sm text-slate-500 italic">none</p>`
+        : Object.entries(plugins).map(([server, tools]) => `
+            <div class="mb-3">
+              <p class="text-sm font-medium font-mono">${escapeHtml(server)}</p>
+              <div class="flex flex-wrap gap-1.5 mt-1">${tools.map((t) =>
+                `<span class="inline-block px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 text-xs font-mono">${escapeHtml(t)}</span>`
+              ).join("")}</div>
+            </div>`).join("");
+
+    const mcpServers = Object.keys(mcp).sort();
+    const mcpSection = mcpServers.length === 0
+        ? `<p class="text-sm text-slate-500 italic">No MCP integrations granted yet. Activate one in <a href="/integrations" class="underline">Integrations</a>, then return here to grant tools.</p>`
+        : mcpServers.map((server) => {
+            const granted = mcp[server];
+            const manifest = manifests[server];
+            const allTools = manifest?.tools ?? {};
+            const known = Object.keys(allTools);
+            const rows = known.length > 0
+                ? known.map((tool) => {
+                    const meta = allTools[tool] ?? {};
+                    const isGranted = granted.has(tool) || granted.has("*");
+                    const dot = isGranted ? "bg-emerald-500" : "bg-slate-200";
+                    const destructive = meta.destructive ? `<span class="ml-2 text-xs text-rose-600">⚠ destructive</span>` : "";
+                    return `
+                        <li class="flex items-center justify-between py-1.5 border-b border-slate-100 last:border-0">
+                          <div class="flex items-center gap-3">
+                            <span class="w-2 h-2 rounded-full ${dot}"></span>
+                            <span class="font-mono text-sm">${escapeHtml(tool)}</span>
+                            ${destructive}
+                          </div>
+                          <span class="text-xs text-slate-500">${escapeHtml(meta.description ?? "")}</span>
+                        </li>`;
+                  }).join("")
+                : Array.from(granted).map((tool) => `
+                    <li class="flex items-center gap-3 py-1.5 border-b border-slate-100 last:border-0">
+                      <span class="w-2 h-2 rounded-full bg-emerald-500"></span>
+                      <span class="font-mono text-sm">${escapeHtml(tool)}</span>
+                      <span class="text-xs text-slate-400">(no manifest)</span>
+                    </li>`).join("");
+            return `
+                <div class="bg-white rounded-xl border border-slate-200 p-5 mb-4">
+                  <div class="flex items-baseline justify-between mb-2">
+                    <h3 class="font-medium">${escapeHtml(manifest?.title ?? server)}</h3>
+                    <span class="text-xs text-slate-500 font-mono">${escapeHtml(server)}</span>
+                  </div>
+                  ${manifest?.description ? `<p class="text-sm text-slate-600 mb-3">${escapeHtml(manifest.description)}</p>` : ""}
+                  <ul>${rows}</ul>
+                </div>`;
+        }).join("");
+
+    return c.html(layout(`${name} — permissions`, `
+        <div class="flex items-center justify-between mb-6">
+          <div>
+            <h1 class="text-2xl font-semibold tracking-tight">${escapeHtml(name)} permissions</h1>
+            <p class="text-slate-600 text-sm">What this agent is allowed to do.</p>
+          </div>
+          ${button("Back to agent", { href: `/agent/${name}`, intent: "secondary" })}
+        </div>
+
+        <div class="bg-white rounded-xl border border-slate-200 p-5 mb-4">
+          <h3 class="font-medium mb-2">Always granted</h3>
+          <p class="text-xs text-slate-500 mb-3">Built-in tools and plugin tools — every agent gets these.</p>
+          <p class="text-sm font-medium mt-2 mb-1">Built-ins</p>
+          ${builtinList}
+          <p class="text-sm font-medium mt-3 mb-1">Plugin tools</p>
+          ${pluginsList}
+        </div>
+
+        <h2 class="text-lg font-medium mb-3 mt-6">MCP integrations</h2>
+        ${mcpSection}
+
+        <p class="text-xs text-slate-500 mt-6">
+          Editable matrix coming soon. For now this is read-only —
+          edit <code>/home/${escapeHtml(name)}/.claude/settings.json</code> directly and restart the service.
+        </p>
+    `, "agents"));
 });
 
 function errorPage(title: string, detail = ""): string {
