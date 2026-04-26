@@ -179,6 +179,23 @@ cmd_create() {
 
     cp "$TEMPLATES/settings.json.tmpl" "$home/.claude/settings.json"
 
+    # CLAUDE.md — operating instructions for the agent (anti-hallucination,
+    # tool honesty, destructive-confirmation, credential safety). Read by
+    # claude-code at session start.
+    if [[ -f "$TEMPLATES/CLAUDE.md.tmpl" ]]; then
+        local persona_block=""
+        if [[ -n "$persona" ]]; then
+            persona_block="## Your persona
+
+$persona"
+        fi
+        render_template "$TEMPLATES/CLAUDE.md.tmpl" \
+            "AGENT_NAME=$name" \
+            "AGENT_PERSONA_BLOCK=$persona_block" \
+            "TELEGRAM_CHAT_ID=$telegram_chat_id" \
+            > "$home/CLAUDE.md"
+    fi
+
     # 4a. Telegram allowlist — empty file means the bot ignores every message.
     # When --telegram-chat-id was given, render an access.json so this chat
     # can talk to the bot from the first message.
