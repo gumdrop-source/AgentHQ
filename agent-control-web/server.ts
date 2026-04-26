@@ -467,7 +467,10 @@ app.get("/integrations/:id/activate", (c) => {
     const credFields = (m.credentials ?? []).map((cred: any) => `
         <div>
           <label class="block text-sm font-medium mb-1">${escapeHtml(cred.label ?? cred.key)}${cred.secret ? " <span class='text-xs text-slate-400 font-normal'>(secret)</span>" : ""}</label>
-          <input name="${escapeHtml(cred.key)}" required ${cred.secret ? 'type="password"' : 'type="text"'} autocomplete="off"
+          <input name="${escapeHtml(cred.key)}" required
+                 ${cred.secret ? 'type="password" autocomplete="new-password"' : 'type="text" autocomplete="off"'}
+                 spellcheck="false" autocapitalize="off" autocorrect="off"
+                 data-1p-ignore data-lpignore="true" data-bwignore="true"
                  class="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm">
           ${cred.description ? `<p class="text-xs text-slate-500 mt-1">${escapeHtml(cred.description)}</p>` : ""}
         </div>
