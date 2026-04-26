@@ -16,7 +16,16 @@ const PORT = Number(process.env.PORT ?? 5000);
 
 // ─── HTML helpers ─────────────────────────────────────────────────────────
 
-const layout = (title: string, body: string) => `<!doctype html>
+type NavKey = "agents" | "integrations" | "updates" | "settings" | null;
+
+const layout = (title: string, body: string, active: NavKey = null) => {
+    const navItem = (key: Exclude<NavKey, null>, label: string, href: string) => {
+        const cls = active === key
+            ? "px-3 py-1.5 rounded-md text-sm font-medium bg-slate-900 text-white"
+            : "px-3 py-1.5 rounded-md text-sm font-medium text-slate-600 hover:text-slate-900";
+        return `<a href="${href}" class="${cls}">${label}</a>`;
+    };
+    return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -28,15 +37,26 @@ const layout = (title: string, body: string) => `<!doctype html>
   <style>body{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}</style>
 </head>
 <body class="bg-slate-50 text-slate-900 min-h-screen">
-  <div class="max-w-3xl mx-auto px-6 py-10">
-    <header class="mb-8 flex items-center justify-between">
-      <a href="/" class="text-xl font-semibold tracking-tight">AgentHQ</a>
-      <span class="text-xs text-slate-500">setup wizard</span>
-    </header>
+  <header class="bg-white border-b border-slate-200">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="/" class="flex items-baseline gap-2">
+        <span class="text-lg font-semibold tracking-tight">Agent Control</span>
+        <span class="text-xs text-slate-400">on AgentHQ</span>
+      </a>
+      <nav class="flex items-center gap-1">
+        ${navItem("agents", "Agents", "/")}
+        ${navItem("integrations", "Integrations", "/integrations")}
+        ${navItem("updates", "Updates", "/updates")}
+        ${navItem("settings", "Settings", "/settings")}
+      </nav>
+    </div>
+  </header>
+  <main class="max-w-5xl mx-auto px-6 py-8">
     ${body}
-  </div>
+  </main>
 </body>
 </html>`;
+};
 
 const card = (inner: string) => `<div class="bg-white rounded-xl shadow-sm border border-slate-200 p-8">${inner}</div>`;
 
@@ -88,7 +108,7 @@ app.get("/", (c) => {
 
     // Empty state: wizard-style welcome + "create your first agent" CTA.
     if (agents.length === 0) {
-        return c.html(layout("Welcome", card(`
+        return c.html(layout("Agents", card(`
             ${pageHeader("Welcome to AgentHQ", "The platform is installed. Now provision your first agent.")}
             <div class="space-y-6">
               <section>
@@ -104,7 +124,7 @@ app.get("/", (c) => {
                 ${button("Create your first agent", { href: "/setup/agent" })}
               </div>
             </div>
-        `)));
+        `), "agents"));
     }
 
     // Dashboard: 1+ agents — persistent control surface.
@@ -121,35 +141,43 @@ app.get("/", (c) => {
             </a>`;
     }).join("");
 
-    return c.html(layout("Dashboard", `
+    return c.html(layout("Agents", `
         <div class="flex items-center justify-between mb-6">
           <div>
-            <h1 class="text-2xl font-semibold tracking-tight">Dashboard</h1>
+            <h1 class="text-2xl font-semibold tracking-tight">Agents</h1>
             <p class="text-slate-600 text-sm">${agents.length} agent${agents.length === 1 ? "" : "s"} on this host</p>
           </div>
           ${button("+ Add agent", { href: "/setup/agent" })}
         </div>
 
         ${card(`
-          <h2 class="font-medium mb-3 text-slate-700">Agents</h2>
           <div class="space-y-2">${agentRows}</div>
         `)}
-
-        <div class="mt-6 grid grid-cols-2 gap-4">
-          <div class="bg-white rounded-xl border border-slate-200 p-6 opacity-60">
-            <h3 class="font-medium mb-1">Integrations</h3>
-            <p class="text-sm text-slate-600">Activate M365, Gmail, MYOB, Hikvision, etc. <em>Coming soon.</em></p>
-          </div>
-          <div class="bg-white rounded-xl border border-slate-200 p-6 opacity-60">
-            <h3 class="font-medium mb-1">Updates</h3>
-            <p class="text-sm text-slate-600">Pull the latest AgentHQ + claude binary. <em>Coming soon.</em></p>
-          </div>
-        </div>
-    `));
+    `, "agents"));
 });
 
+// Placeholder section pages — sketch the future shape
+
+app.get("/integrations", (c) => c.html(layout("Integrations", card(`
+    ${pageHeader("Integrations", "Activate the tools your agents can use.")}
+    <p class="text-slate-600">M365, Gmail, MYOB, Xero, Hikvision, Home Assistant, PayPal, Vapi, Twilio…</p>
+    <p class="mt-3 text-sm text-slate-500"><em>Coming soon.</em> Each integration will have a guided setup wizard — instructions for registering the external service, prompts for credentials, validation, and one-click activation. Once activated, every agent on this host has access to it.</p>
+`), "integrations")));
+
+app.get("/updates", (c) => c.html(layout("Updates", card(`
+    ${pageHeader("Updates", "Keep the platform and the claude binary current.")}
+    <p class="text-slate-600">AgentHQ checks for new commits on <code>main</code> and new claude versions from Anthropic.</p>
+    <p class="mt-3 text-sm text-slate-500"><em>Coming soon.</em> One-click "Update now" + a nightly background timer that pulls fresh code, runs <code>install.sh</code> idempotently, and gracefully restarts services.</p>
+`), "updates")));
+
+app.get("/settings", (c) => c.html(layout("Settings", card(`
+    ${pageHeader("Settings", "Host-level configuration.")}
+    <p class="text-slate-600">Telegram defaults, log level, backup path, host nickname, vault method (TPM2/host-key)…</p>
+    <p class="mt-3 text-sm text-slate-500"><em>Coming soon.</em></p>
+`), "settings")));
+
 app.get("/setup/agent", (c) => {
-    return c.html(layout("Create agent", card(`
+    return c.html(layout("Add agent", card(`
         ${pageHeader("Create an agent", "Linux user, claude install, telegram bot wiring — all in one.")}
         <form method="POST" action="/setup/agent" class="space-y-5">
           <div>
@@ -205,7 +233,7 @@ app.post("/setup/agent", async (c) => {
             When provisioning completes, the next step is Claude OAuth login.
           </div>
         </div>
-    `)));
+    `), "agents"));
 });
 
 // SSE stream for agent-control output. Emits "line" events for each chunk
