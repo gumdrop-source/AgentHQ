@@ -475,20 +475,34 @@ app.get("/integrations/:id/activate", (c) => {
           ${cred.description ? `<p class="text-xs text-slate-500 mt-1">${escapeHtml(cred.description)}</p>` : ""}
         </div>
     `).join("");
-    return c.html(layout(`Activate ${m.title ?? id}`, card(`
-        ${pageHeader(`Activate ${escapeHtml(m.title ?? id)}`, "Paste each credential below. They're encrypted into the systemd-creds vault and never logged.")}
-        <form method="POST" action="/integrations/${id}/activate" class="space-y-4">
-          ${credFields}
-          <div class="pt-2 flex gap-3">
-            ${button(`Activate ${escapeHtml(m.title ?? id)}`)}
-            ${button("Cancel", { href: `/integrations/${id}`, intent: "secondary" })}
+    const toolsDir = process.env.AGENTHQ_TOOLS_DIR ?? "/opt/agents/tools";
+    const setupPath = `${toolsDir}/${id}/setup.md`;
+    const setupMd = existsSync(setupPath) ? readFileSync(setupPath, "utf8") : "";
+
+    return c.html(layout(`Activate ${m.title ?? id}`, `
+        <div class="mb-6">
+          <h1 class="text-2xl font-semibold tracking-tight">Activate ${escapeHtml(m.title ?? id)}</h1>
+          <p class="text-slate-600 text-sm">Follow the setup steps on the left, paste the resulting credentials on the right.</p>
+        </div>
+        <div class="grid grid-cols-1 lg:grid-cols-5 gap-6">
+          ${setupMd ? `
+            <div class="lg:col-span-3 bg-white rounded-xl border border-slate-200 p-6">
+              <h3 class="font-medium mb-3">Setup instructions</h3>
+              <pre class="whitespace-pre-wrap text-sm text-slate-700 leading-relaxed">${escapeHtml(setupMd)}</pre>
+            </div>` : ""}
+          <div class="${setupMd ? "lg:col-span-2" : "lg:col-span-5"} bg-white rounded-xl border border-slate-200 p-6 self-start sticky top-4">
+            <h3 class="font-medium mb-3">Credentials</h3>
+            <p class="text-xs text-slate-500 mb-4">Encrypted into the systemd-creds vault. Never logged or echoed.</p>
+            <form method="POST" action="/integrations/${id}/activate" class="space-y-4">
+              ${credFields}
+              <div class="pt-2 flex gap-2">
+                ${button(`Activate`)}
+                ${button("Cancel", { href: `/integrations/${id}`, intent: "secondary" })}
+              </div>
+            </form>
           </div>
-        </form>
-        <details class="mt-6">
-          <summary class="text-sm text-slate-600 cursor-pointer">Setup instructions</summary>
-          <pre class="whitespace-pre-wrap text-xs text-slate-600 mt-3">${escapeHtml(existsSync(`${process.env.AGENTHQ_TOOLS_DIR ?? "/opt/agents/tools"}/${id}/setup.md`) ? readFileSync(`${process.env.AGENTHQ_TOOLS_DIR ?? "/opt/agents/tools"}/${id}/setup.md`, "utf8") : "")}</pre>
-        </details>
-    `), "integrations", c.get("user")));
+        </div>
+    `, "integrations", c.get("user")));
 });
 
 app.post("/integrations/:id/activate", async (c) => {
