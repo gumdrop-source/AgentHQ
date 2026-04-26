@@ -141,7 +141,18 @@ cmd_create() {
     log "Creating home tree"
     sudo -u "$name" mkdir -p "$home/memory" "$home/skills" "$home/logs" "$home/.claude"
 
-    # 3. Render templates
+    # 3. Install claude binary first — we need its version string when
+    #    rendering claude-config.json (lastOnboardingVersion has to match
+    #    what's installed or the onboarding gate doesn't take).
+    log "Installing claude binary as $name (~30s, ~240 MB)"
+    sudo -u "$name" -H bash -c "curl -fsSL $CLAUDE_INSTALL_URL | bash" >/dev/null
+
+    local claude_version
+    claude_version="$(ls -1 "$home/.local/share/claude/versions/" 2>/dev/null | sort -V | tail -1 || true)"
+    [[ -n "$claude_version" ]] || die "claude install did not produce $home/.local/share/claude/versions/"
+    log "Claude installed: $claude_version"
+
+    # 4. Render templates
     log "Rendering config from $TEMPLATES"
     render_template "$TEMPLATES/agent.toml.tmpl" \
         "AGENT_NAME=$name" \
@@ -152,7 +163,7 @@ cmd_create() {
         > "$home/agent.toml"
 
     render_template "$TEMPLATES/claude-config.json.tmpl" \
-        "CLAUDE_VERSION=" \
+        "CLAUDE_VERSION=$claude_version" \
         "AGENT_HOME=$home" \
         "ENABLED_MCP_SERVERS_JSON=$(mcp_servers_json "$tools")" \
         > "$home/.claude.json"
@@ -160,10 +171,6 @@ cmd_create() {
     cp "$TEMPLATES/settings.json.tmpl" "$home/.claude/settings.json"
 
     chown -R "$name:$name" "$home/agent.toml" "$home/.claude.json" "$home/.claude"
-
-    # 4. Install claude binary as the agent (per-agent install)
-    log "Installing claude binary as $name (~30s, ~240 MB)"
-    sudo -u "$name" -H bash -c "curl -fsSL $CLAUDE_INSTALL_URL | bash" >/dev/null
 
     # 5. Systemd credential drop-in
     log "Writing systemd credential drop-in"
