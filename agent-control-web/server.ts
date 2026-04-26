@@ -202,8 +202,19 @@ app.get("/setup/agent/stream", (c) => {
             env: { ...process.env, AGENTHQ_SKIP_CLAUDE_LOGIN: "1" },
         });
 
-        for await (const chunk of child.stdout) await s.writeSSE({ event: "line", data: chunk.toString() });
-        for await (const chunk of child.stderr) await s.writeSSE({ event: "line", data: chunk.toString() });
+        // Heartbeat every 5s to keep proxies/browsers from reaping the
+        // connection during slow steps (e.g. the 30s claude binary install).
+        // Without this, EventSource auto-reconnect re-fires the whole spawn.
+        const heartbeat = setInterval(() => {
+            s.writeSSE({ event: "ping", data: "" }).catch(() => {});
+        }, 5000);
+
+        try {
+            for await (const chunk of child.stdout) await s.writeSSE({ event: "line", data: chunk.toString() });
+            for await (const chunk of child.stderr) await s.writeSSE({ event: "line", data: chunk.toString() });
+        } finally {
+            clearInterval(heartbeat);
+        }
         const exitCode: number = await new Promise((r) => child.on("close", r));
 
         await s.writeSSE({ event: "line", data: `\n[wizard] agent-control exited with code ${exitCode}\n` });

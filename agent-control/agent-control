@@ -149,7 +149,12 @@ cmd_create() {
     #    rendering claude-config.json (lastOnboardingVersion has to match
     #    what's installed or the onboarding gate doesn't take).
     log "Installing claude binary as $name (~30s, ~240 MB)"
-    sudo -u "$name" -H bash -c "curl -fsSL $CLAUDE_INSTALL_URL | bash" >/dev/null
+    # Surface installer output (kept brief by piping through grep) so the
+    # web wizard's SSE stream doesn't go silent for 30s — silent connections
+    # get reaped by EventSource auto-reconnect, which re-fires this whole
+    # function and trips 'user already exists' on the second attempt.
+    sudo -u "$name" -H bash -c "curl -fsSL $CLAUDE_INSTALL_URL | bash" 2>&1 \
+        | grep --line-buffered -E '%|installing|Installing|claude' || true
 
     local claude_version
     claude_version="$(ls -1 "$home/.local/share/claude/versions/" 2>/dev/null | sort -V | tail -1 || true)"
