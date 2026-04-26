@@ -47,7 +47,9 @@ that mapping should move into per-tool `tool.toml` files (see `tools/README.md`)
 
 ## Prior art
 
-A Python prototype lives at `/home/alice/agent-control/` (removed's
-existing system). This bash MVP captures the essential creation flow
-without the schema/migration overhead. We can replace it with a richer
-implementation later when the requirements are clearer.
+A more sophisticated TypeScript prototype with a SQLite schema and a
+Next.js web UI exists outside this repo. This bash MVP captures the
+essential creation flow without that overhead. The richer
+implementation can land later, once the requirements are clearer
+and the wizard-driven integration model (see architecture.md) is in
+place.
