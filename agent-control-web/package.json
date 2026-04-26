@@ -1,7 +1,7 @@
 {
   "name": "agent-control-web",
-  "version": "0.1.0",
-  "description": "AgentHQ setup wizard — local web UI",
+  "version": "0.2.0",
+  "description": "AgentHQ control plane — multi-user web UI",
   "type": "module",
   "private": true,
   "scripts": {
