@@ -132,7 +132,7 @@ app.get("/setup/agent", (c) => {
           </div>
           <div>
             <label class="block text-sm font-medium mb-1">Your Telegram chat ID</label>
-            <input name="telegram_chat_id" required pattern="[0-9]+" placeholder="7716112263"
+            <input name="telegram_chat_id" required pattern="[0-9]+" placeholder="123456789"
               class="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm">
             <p class="text-xs text-slate-500 mt-1">Find yours by messaging @userinfobot in Telegram.</p>
           </div>
