@@ -15,7 +15,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, get_origin, get_type_hints
 
 import msal
 import requests
@@ -31,24 +31,33 @@ def _decrypt_cred(name: str) -> str | None:
 
     Inside a systemd service with `LoadCredentialEncrypted=`, the decrypted
     plaintext sits at $CREDENTIALS_DIRECTORY/<name>. Outside (interactive
-    debugging), shell out to `systemd-creds decrypt`.
+    debugging as root), shell out to `systemd-creds decrypt`.
+
+    All filesystem ops are guarded so an inaccessible cred yields None
+    (caller falls back to env vars) rather than crashing module import.
+    Python 3.12 changed Path.exists() to propagate PermissionError — and
+    /etc/agents/credentials/*.cred is root:root 0600 — so the bare
+    `cred_path.exists()` check used to crash the unprivileged service user
+    at module-import time, which broke the MCP stdio handshake.
     """
     runtime_dir = os.environ.get("CREDENTIALS_DIRECTORY")
     if runtime_dir:
-        path = Path(runtime_dir) / name
-        if path.exists():
-            return path.read_text().strip()
-    cred_path = CRED_DIR / f"{name}.cred"
-    if cred_path.exists():
         try:
-            r = subprocess.run(
-                ["systemd-creds", "decrypt", str(cred_path), "-", f"--name={name}"],
-                capture_output=True, text=True, timeout=5, check=False,
-            )
-            if r.returncode == 0 and r.stdout:
-                return r.stdout.strip()
-        except FileNotFoundError:
+            return (Path(runtime_dir) / name).read_text().strip()
+        except OSError:
             pass
+    cred_path = CRED_DIR / f"{name}.cred"
+    if not os.access(cred_path, os.R_OK):
+        return None
+    try:
+        r = subprocess.run(
+            ["systemd-creds", "decrypt", str(cred_path), "-", f"--name={name}"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        if r.returncode == 0 and r.stdout:
+            return r.stdout.strip()
+    except (FileNotFoundError, OSError):
+        pass
     return None
 
 
@@ -76,11 +85,30 @@ _cache = msal.SerializableTokenCache()
 if TOKEN_CACHE_FILE.exists():
     _cache.deserialize(TOKEN_CACHE_FILE.read_text())
 
-_app = msal.PublicClientApplication(
-    CLIENT_ID,
-    authority=f"https://login.microsoftonline.com/{TENANT_ID}",
-    token_cache=_cache,
-)
+# Lazy: msal.PublicClientApplication validates the authority URL during
+# construction and raises ValueError if TENANT_ID is empty. Building it
+# eagerly at module import would crash any spawn that doesn't have creds
+# in environ — and the crash kills the MCP handshake before tool listing.
+# Defer construction so the server can register tools and only fail (with
+# a clear error) when a tool is actually invoked without creds.
+_app: msal.PublicClientApplication | None = None
+
+
+def _get_app() -> msal.PublicClientApplication:
+    global _app
+    if _app is None:
+        if not (TENANT_ID and CLIENT_ID):
+            raise RuntimeError(
+                "Microsoft 365 credentials are not loaded. The operator must "
+                "activate the m365 integration in agent-control (which provisions "
+                "the encrypted credentials and reloads the agent service)."
+            )
+        _app = msal.PublicClientApplication(
+            CLIENT_ID,
+            authority=f"https://login.microsoftonline.com/{TENANT_ID}",
+            token_cache=_cache,
+        )
+    return _app
 
 
 def _save_cache() -> None:
@@ -131,7 +159,7 @@ def _try_complete_pending_flow() -> str | None:
         return attempts["n"] >= 1
 
     try:
-        result = _app.acquire_token_by_device_flow(flow, exit_condition=one_poll)
+        result = _get_app().acquire_token_by_device_flow(flow, exit_condition=one_poll)
     except Exception:
         PENDING_FLOW_FILE.unlink(missing_ok=True)
         return None
@@ -146,10 +174,11 @@ def _try_complete_pending_flow() -> str | None:
 
 
 def _token() -> str:
+    app = _get_app()
     # 1. Try silent refresh from cached account
-    accounts = _app.get_accounts()
+    accounts = app.get_accounts()
     if accounts:
-        result = _app.acquire_token_silent(SCOPES, account=accounts[0])
+        result = app.acquire_token_silent(SCOPES, account=accounts[0])
         if result and "access_token" in result:
             _save_cache()
             return result["access_token"]
@@ -160,7 +189,7 @@ def _token() -> str:
         return completed
 
     # 3. No cached account, no pending flow — start a new device flow
-    flow = _app.initiate_device_flow(scopes=SCOPES)
+    flow = app.initiate_device_flow(scopes=SCOPES)
     if "user_code" not in flow:
         raise RuntimeError(f"Failed to start device flow: {flow}")
     PENDING_FLOW_FILE.write_text(json.dumps(flow))
@@ -169,13 +198,27 @@ def _token() -> str:
 
 def requires_auth(fn: Callable) -> Callable:
     """Decorator: catch AuthRequired and return a structured response that
-    instructs the agent to relay the sign-in URL+code to the user."""
+    instructs the agent to relay the sign-in URL+code to the user.
+
+    The auth payload is wrapped in a list when the wrapped tool's declared
+    return type is list-shaped — without this, FastMCP's pydantic output
+    validation rejects the dict against e.g. `list[dict]` annotations.
+    """
+    # Resolve annotations once at decoration time. `from __future__ import
+    # annotations` keeps fn.__annotations__ as strings, so get_type_hints()
+    # is required to materialize the actual types.
+    try:
+        return_anno = get_type_hints(fn).get("return")
+    except Exception:
+        return_anno = None
+    list_returning = get_origin(return_anno) is list or return_anno is list
+
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         try:
             return fn(*args, **kwargs)
         except AuthRequired as e:
-            return {
+            payload = {
                 "auth_required": True,
                 "message": (
                     f"To do that I need access to your Microsoft 365. "
@@ -185,6 +228,7 @@ def requires_auth(fn: Callable) -> Callable:
                 "verification_uri": e.verification_uri,
                 "user_code": e.user_code,
             }
+            return [payload] if list_returning else payload
     return wrapper
 
 
