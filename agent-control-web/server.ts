@@ -158,20 +158,28 @@ app.post("/setup/agent", async (c) => {
         return c.html(errorPage("Invalid Telegram chat ID", "Must be all digits."));
     }
 
+    // Single SSE connection on the parent div. Children use sse-swap to
+    // pick which event they consume — keeps it to one EventSource (and
+    // therefore one agent-control invocation). sse-close="done" stops
+    // the auto-reconnect loop once provisioning finishes either way.
+    const streamUrl = `/setup/agent/stream?name=${encodeURIComponent(name)}&persona=${encodeURIComponent(persona)}&chat_id=${encodeURIComponent(chatId)}`;
     return c.html(layout("Provisioning", card(`
         ${pageHeader(`Provisioning ${escapeHtml(name)}`, "This takes about a minute. Live output below.")}
-        <pre class="bg-slate-900 text-slate-100 rounded-lg p-4 text-xs font-mono overflow-auto max-h-96"
-             hx-ext="sse"
-             sse-connect="/setup/agent/stream?name=${encodeURIComponent(name)}&persona=${encodeURIComponent(persona)}&chat_id=${encodeURIComponent(chatId)}"
-             sse-swap="line"
-             hx-swap="beforeend"></pre>
-        <div class="mt-4 text-sm text-slate-600">When provisioning completes, the next step is Claude OAuth login.</div>
+        <div hx-ext="sse" sse-connect="${streamUrl}" sse-close="done">
+          <pre id="provision-log" sse-swap="line" hx-swap="beforeend"
+               class="bg-slate-900 text-slate-100 rounded-lg p-4 text-xs font-mono overflow-auto max-h-96"></pre>
+          <div id="next-step" sse-swap="redirect" hx-swap="innerHTML"
+               class="mt-4 text-sm text-slate-600">
+            When provisioning completes, the next step is Claude OAuth login.
+          </div>
+        </div>
     `)));
 });
 
-// SSE stream for agent-control output. NOTE: this MVP doesn't yet handle
-// the interactive `claude` login — that step lands in /setup/claude as a
-// separate page.
+// SSE stream for agent-control output. Emits "line" events for each chunk
+// of stdout/stderr, a "redirect" event with HTML to swap into the next-step
+// div on success, and a final "done" event so the client closes the
+// connection (otherwise EventSource auto-reconnects and re-fires the create).
 app.get("/setup/agent/stream", (c) => {
     const name = c.req.query("name") ?? "";
     const persona = c.req.query("persona") ?? "";
@@ -179,10 +187,11 @@ app.get("/setup/agent/stream", (c) => {
     if (!/^[a-z][a-z0-9_-]{1,30}$/.test(name)) return c.text("invalid name", 400);
 
     return streamSSE(c, async (s) => {
-        s.writeSSE({ event: "line", data: `[wizard] starting agent-control create ${name}\n` });
-        // The systemd service runs as root, so we invoke agent-control directly.
-        // AGENTHQ_SKIP_CLAUDE_LOGIN tells it to defer the OAuth step — the
-        // wizard handles that on its own page since OAuth is interactive.
+        await s.writeSSE({ event: "line", data: `[wizard] starting agent-control create ${name}\n` });
+
+        // Server runs as root via systemd. AGENTHQ_SKIP_CLAUDE_LOGIN tells
+        // agent-control to defer the OAuth step — the wizard handles that on
+        // its own page since OAuth is interactive.
         const child = spawn("/usr/local/bin/agent-control", [
             "create",
             name,
@@ -196,10 +205,20 @@ app.get("/setup/agent/stream", (c) => {
         for await (const chunk of child.stdout) await s.writeSSE({ event: "line", data: chunk.toString() });
         for await (const chunk of child.stderr) await s.writeSSE({ event: "line", data: chunk.toString() });
         const exitCode: number = await new Promise((r) => child.on("close", r));
+
         await s.writeSSE({ event: "line", data: `\n[wizard] agent-control exited with code ${exitCode}\n` });
+
         if (exitCode === 0) {
-            await s.writeSSE({ event: "line", data: `[wizard] redirecting to /setup/claude/${name} in a moment...\n` });
+            await s.writeSSE({ event: "line", data: `[wizard] success — taking you to Claude login\n` });
+            await s.writeSSE({
+                event: "redirect",
+                data: `<a href="/setup/claude/${name}" class="underline">Provisioning complete — continue to Claude login →</a><script>setTimeout(()=>location.href="/setup/claude/${name}", 800)</script>`,
+            });
+        } else {
+            await s.writeSSE({ event: "line", data: `[wizard] failed — fix the error above and try again\n` });
         }
+
+        await s.writeSSE({ event: "done", data: "" });
     });
 });
 
