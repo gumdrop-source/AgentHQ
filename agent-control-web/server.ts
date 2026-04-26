@@ -1169,15 +1169,41 @@ app.post("/agent/:name/permissions", async (c) => {
     });
 
     const added: string[] = [];
+    const grantedSet = new Set<string>();
     for (const g of grants) {
         const [server, ...rest] = g.split("__");
         if (!server || rest.length === 0) continue;
         if (!managedIds.has(server)) continue; // silently ignore tampering
-        added.push(`mcp__${server}__${rest.join("__")}`);
+        const tool = rest.join("__");
+        added.push(`mcp__${server}__${tool}`);
+        grantedSet.add(`${server}__${tool}`);
     }
+
+    // Operator intent must be authoritative: tools the operator did NOT tick
+    // go into permissions.deny so claude refuses without prompting. Without
+    // this, untouched tools fall through to claude's default ask-the-user
+    // behavior, and the telegram plugin surfaces the prompt as inline buttons —
+    // letting the user grant a permission the operator deliberately withheld.
+    const allDenied: string[] = [];
+    for (const it of integrations) {
+        const manifest = loadManifest(it.id);
+        const toolNames = manifest?.tools ? Object.keys(manifest.tools) : [];
+        for (const toolName of toolNames) {
+            if (grantedSet.has(`${it.id}__${toolName}`)) continue;
+            allDenied.push(`mcp__${it.id}__${toolName}`);
+        }
+    }
+    const existingDeny: string[] = settings?.permissions?.deny ?? [];
+    const keptDeny = existingDeny.filter((entry: string) => {
+        if (!entry.startsWith("mcp__") || entry.startsWith("mcp__plugin_")) return true;
+        const m = entry.match(/^mcp__([^_]+(?:_[^_]+)*?)__/);
+        if (!m) return true;
+        return !managedIds.has(m[1]);
+    });
 
     settings.permissions ??= {};
     settings.permissions.allow = [...new Set([...kept, ...added])];
+    settings.permissions.deny = [...new Set([...keptDeny, ...allDenied])];
 
     try {
         const fs = await import("node:fs");
