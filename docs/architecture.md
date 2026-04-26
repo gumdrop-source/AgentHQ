@@ -89,6 +89,75 @@ them per-agent at provision time.
 Per-agent provisioning happens later via `agent-control create`,
 not as part of bootstrap.
 
+## Integration model — interactive setup wizards
+
+Tools ship with the platform but start **inactive**. The user activates
+integrations one at a time through `agent-control integrations`, which
+walks them through registering each external service, prompts for the
+credentials, validates them with a test API call, and stores them in
+the vault.
+
+```
+sudo agent-control integrations               # list catalog + active state
+sudo agent-control integrations enable m365   # run wizard for M365
+sudo agent-control integrations disable m365  # remove creds, mark inactive
+```
+
+This means:
+
+- A fresh AgentHQ install has zero credentials. Nothing is "wired up"
+  until the user activates it. That's the public-grade discipline —
+  anyone can clone the repo without inheriting anything sensitive.
+- Adding an integration is one guided flow per integration, not a
+  sequence of "where do I find this token" lookups across docs.
+- `agent-control create alice` auto-includes every *active*
+  integration — no `--tools` flag, no manual cred mapping. New
+  agents inherit the host's wired-up integrations by default.
+- Per-agent restriction (e.g. Allen for sales gets no MYOB) is opt-out
+  via `disabled_tools` in `agent.toml`.
+
+### Per-tool repo layout
+
+```
+tools/<name>/
+├── setup.md           human setup instructions (copy-paste-friendly)
+├── setup.json         cred schema — fields, descriptions, validation rules
+├── tool.toml          metadata: name, version, description
+├── server.py          MCP server (Python)  — or server.ts for Node
+└── requirements.txt   (or package.json)
+```
+
+`setup.json` example:
+
+```json
+{
+  "name": "m365",
+  "credentials": [
+    {
+      "key": "tenant_id",
+      "prompt": "Microsoft 365 tenant ID",
+      "description": "Found in Azure Portal → Microsoft Entra ID → Overview",
+      "validate": "uuid"
+    },
+    {
+      "key": "client_id",
+      "prompt": "Application (client) ID",
+      "validate": "uuid"
+    },
+    {
+      "key": "client_secret",
+      "prompt": "Client secret value",
+      "secret": true
+    }
+  ],
+  "test": "python -m m365 --self-test"
+}
+```
+
+The current `agent-control` bash MVP doesn't implement this yet — it
+hardcodes a tool→cred mapping. The refactor to read `setup.json` and
+run the wizards is queued behind the basic install smoke test.
+
 ## Claude binary — per-agent install
 
 Decision: install claude **per agent**, not system-wide.
