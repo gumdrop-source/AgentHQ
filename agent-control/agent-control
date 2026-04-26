@@ -172,22 +172,40 @@ cmd_create() {
     write_credentials_dropin "$name" "$tools" > "$dropin_dir/credentials.conf"
     chmod 0644 "$dropin_dir/credentials.conf"
 
-    # 6. Enable + start service
-    log "Enabling agent@$name.service"
+    # 6. Enable service. Whether to start it depends on whether the agent's
+    # required credentials are already in the vault. Missing creds = systemd
+    # LoadCredentialEncrypted= fails the unit. Better to leave it stopped
+    # with a clear list of what's needed than to start a doomed service.
     systemctl daemon-reload
-    systemctl enable --now "agent@$name.service"
 
-    log "Agent '$name' created. Status:"
-    systemctl --no-pager status "agent@$name.service" | head -8 || true
-    cat <<EOF
+    local -a missing=()
+    while IFS= read -r line; do
+        [[ "$line" =~ ^LoadCredentialEncrypted=([^:]+):(.+)$ ]] || continue
+        local cred_path="${BASH_REMATCH[2]}"
+        [[ -f "$cred_path" ]] || missing+=("$(basename "${cred_path%.cred}")")
+    done < "$dropin_dir/credentials.conf"
 
-Next:
-  1. Inject this agent's credentials into the vault:
-       sudo agenthq-cred set ${name}_telegram_bot_token   # paste token, Ctrl-D
-       sudo agenthq-cred set <other-cred-name> ...
-  2. Restart the service so it picks up new creds:
-       sudo systemctl restart agent@$name.service
-EOF
+    if (( ${#missing[@]} == 0 )); then
+        log "All required credentials present — enabling and starting service"
+        systemctl enable --now "agent@$name.service"
+        systemctl --no-pager status "agent@$name.service" | head -6 || true
+        echo
+        log "Agent '$name' is up."
+    else
+        log "Enabling service (will start on boot)"
+        systemctl enable "agent@$name.service"
+        echo
+        echo "Agent '$name' provisioned but service NOT started — missing credentials:"
+        for c in "${missing[@]}"; do
+            echo "  - $c"
+        done
+        echo
+        echo "Inject each one into the vault, then start the service:"
+        for c in "${missing[@]}"; do
+            echo "    sudo agenthq-cred set $c       # paste value, Ctrl-D"
+        done
+        echo "    sudo systemctl start agent@$name.service"
+    fi
 }
 
 cmd_delete() {
