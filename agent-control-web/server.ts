@@ -243,11 +243,12 @@ app.get("/setup/claude/:name", (c) => {
             ? `<p class="text-emerald-600 font-medium">✅ Already signed in.</p>
                <div class="mt-4">${button("Continue", { href: `/setup/token/${name}` })}</div>`
             : `<ol class="list-decimal list-inside text-sm text-slate-700 space-y-2 mb-4">
-                 <li>Open a terminal on this box and run:
-                   ${code(`sudo -i -u ${name} claude`)}
+                 <li>Open a terminal on this box and run these two commands:
+                   ${code(`xhost +SI:localuser:${name}\nsudo -i -u ${name} claude`)}
+                   <p class="text-xs text-slate-500 mt-1">First line grants <code>${escapeHtml(name)}</code> access to your X clipboard so claude's "c to copy" works. Second drops you into claude as that user.</p>
                  </li>
                  <li>Inside claude, type <code class="bg-slate-100 px-1 rounded">/login</code> and pick "Claude.ai login"</li>
-                 <li>Claude prints a URL. <strong>Press <code class="bg-slate-100 px-1 rounded">c</code> to copy it</strong> (the URL wraps over several lines in the terminal — copying via <code>c</code> grabs the full URL regardless)</li>
+                 <li>Claude prints a URL. <strong>Press <code class="bg-slate-100 px-1 rounded">c</code> to copy it</strong> (the URL wraps over several lines but the <code>c</code> shortcut grabs it cleanly)</li>
                  <li>Open a browser, paste the URL, sign in to your Anthropic account</li>
                  <li>Browser redirects you with a code — copy it, paste into the "Paste code here if prompted" field in the terminal, hit Enter</li>
                  <li>Type <code class="bg-slate-100 px-1 rounded">/exit</code> to leave claude</li>
