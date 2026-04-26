@@ -1,0 +1,8 @@
+# Token cache contains a refresh token — never commit it.
+.token_cache.json
+.m365_token_cache.json
+
+# Python venv (created by Phase 30)
+.venv/
+__pycache__/
+*.pyc

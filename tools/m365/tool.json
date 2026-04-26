@@ -1,0 +1,64 @@
+{
+  "name": "m365",
+  "title": "Microsoft 365",
+  "description": "Read, search, draft, and archive email; manage calendar events; search and read OneDrive files. Uses Microsoft Graph API with delegated auth.",
+  "credentials": [
+    {
+      "key": "m365_tenant_id",
+      "label": "Tenant ID",
+      "description": "Azure AD tenant GUID. Find it in Azure Portal → Microsoft Entra ID → Overview."
+    },
+    {
+      "key": "m365_client_id",
+      "label": "Application (client) ID",
+      "description": "GUID of the Azure AD app registration."
+    },
+    {
+      "key": "m365_client_secret",
+      "label": "Client secret",
+      "secret": true,
+      "description": "Generated at App registrations → Certificates & secrets → New client secret. Copy the VALUE, not the ID."
+    }
+  ],
+  "tools": {
+    "outlook_email_search": {
+      "description": "Search inbox by query, sender, date, or unread flag"
+    },
+    "outlook_email_read": {
+      "description": "Read one email's full body by message id"
+    },
+    "outlook_email_draft": {
+      "description": "Create a draft email in the user's mailbox (does NOT send)"
+    },
+    "outlook_email_send": {
+      "description": "Send an email immediately",
+      "destructive": true
+    },
+    "outlook_email_archive": {
+      "description": "Move an email from Inbox to Archive"
+    },
+    "outlook_email_delete": {
+      "description": "Permanently delete an email",
+      "destructive": true
+    },
+    "calendar_search": {
+      "description": "List calendar events in a date range"
+    },
+    "calendar_create_event": {
+      "description": "Create a new calendar event with attendees, location, body"
+    },
+    "calendar_update_event": {
+      "description": "Modify an existing calendar event"
+    },
+    "calendar_delete_event": {
+      "description": "Cancel and delete a calendar event",
+      "destructive": true
+    },
+    "onedrive_search": {
+      "description": "Find files in the user's OneDrive by name or content"
+    },
+    "onedrive_read": {
+      "description": "Download and read the contents of a OneDrive file"
+    }
+  }
+}
