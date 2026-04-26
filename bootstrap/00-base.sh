@@ -11,7 +11,8 @@ apt_ensure \
     build-essential git curl wget ca-certificates rsync \
     sqlite3 jq \
     ufw unattended-upgrades \
-    tpm2-tools
+    tpm2-tools \
+    xclip wl-clipboard
 
 # bun — installed system-wide so every agent's claude session can spawn the
 # telegram plugin's bun-based bot poller (this was a silent blocker on
