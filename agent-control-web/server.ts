@@ -451,6 +451,48 @@ app.get("/integrations/:id", (c) => {
     `, "integrations", c.get("user")));
 });
 
+// Generate /home/<agent>/.mcp.json registering every ACTIVE integration as
+// an MCP server. Claude reads this at session start to discover available
+// servers; settings.json's permissions.allow then gates which specific
+// tools the agent can actually call.
+//
+// Without this, even a fully-permitted tool fails because claude doesn't
+// know the server exists.
+async function writeMcpJson(agentName: string): Promise<void> {
+    const fs = await import("node:fs");
+    const integrations = listIntegrations().filter((it) => it.active);
+    const toolsDir = process.env.AGENTHQ_TOOLS_DIR ?? "/opt/agents/tools";
+    const mcpServers: Record<string, any> = {};
+    for (const it of integrations) {
+        const venvPython = `${toolsDir}/${it.id}/.venv/bin/python`;
+        const serverPy = `${toolsDir}/${it.id}/server.py`;
+        const serverTs = `${toolsDir}/${it.id}/server.ts`;
+        if (existsSync(venvPython) && existsSync(serverPy)) {
+            mcpServers[it.id] = { type: "stdio", command: venvPython, args: [serverPy] };
+        } else if (existsSync(serverTs)) {
+            mcpServers[it.id] = { type: "stdio", command: "/usr/local/bin/bun", args: ["run", serverTs] };
+        }
+    }
+    const path = `/home/${agentName}/.mcp.json`;
+    fs.writeFileSync(path, JSON.stringify({ mcpServers }, null, 2));
+    spawnSync("/bin/chown", [`${agentName}:${agentName}`, path]);
+
+    // Also pre-approve each integration in the agent's .claude.json so the
+    // first claude session doesn't prompt to trust the .mcp.json servers.
+    const claudeJsonPath = `/home/${agentName}/.claude.json`;
+    if (existsSync(claudeJsonPath)) {
+        try {
+            const claudeJson = JSON.parse(fs.readFileSync(claudeJsonPath, "utf8"));
+            const homeKey = `/home/${agentName}`;
+            claudeJson.projects ??= {};
+            claudeJson.projects[homeKey] ??= {};
+            claudeJson.projects[homeKey].enabledMcpjsonServers = Object.keys(mcpServers);
+            fs.writeFileSync(claudeJsonPath, JSON.stringify(claudeJson, null, 2));
+            spawnSync("/bin/chown", [`${agentName}:${agentName}`, claudeJsonPath]);
+        } catch {}
+    }
+}
+
 // Helper — read manifest for an integration
 function loadManifest(id: string): any | null {
     if (!/^[a-z][a-z0-9_-]*$/.test(id)) return null;
@@ -1095,7 +1137,10 @@ app.post("/agent/:name/permissions", async (c) => {
     // Re-set ownership to the agent — atomic write may have left it root-owned
     spawnSync("/bin/chown", [`${name}:${name}`, settingsPath]);
 
-    // Restart agent so the new permission set is read
+    // Refresh .mcp.json so claude discovers any newly-activated integrations
+    await writeMcpJson(name);
+
+    // Restart agent so the new permission set + .mcp.json are read
     spawnSync("systemctl", ["restart", `agent@${name}.service`]);
     return c.redirect(`/agent/${name}/permissions?saved=1`);
 });
