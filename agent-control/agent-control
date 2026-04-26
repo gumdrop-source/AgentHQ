@@ -189,12 +189,16 @@ EOF
 
     # 4b. Authenticate claude. The binary is installed but has no Anthropic
     # OAuth token, so without this step the bot would receive messages and
-    # silently fail when it tries to call the API. Prompt the user through
-    # an interactive `claude` session — they get a URL to open in a browser,
-    # paste the code back, then /exit. We then verify the credentials file
-    # was created.
+    # silently fail when it tries to call the API.
+    #
+    # When run from the web wizard, the env var AGENTHQ_SKIP_CLAUDE_LOGIN=1
+    # tells us the wizard is taking responsibility for the login step on
+    # its own page (since the OAuth flow is interactive and TTY-bound, it
+    # can't run as a child of a non-interactive subprocess).
     if [[ -f "$home/.claude/.credentials.json" ]]; then
         log "Claude already authenticated for $name — skipping login"
+    elif [[ "${AGENTHQ_SKIP_CLAUDE_LOGIN:-}" == "1" ]]; then
+        log "Skipping claude login (AGENTHQ_SKIP_CLAUDE_LOGIN=1) — caller will handle"
     else
         log "Authenticating claude as $name — interactive login required"
         cat <<EOF

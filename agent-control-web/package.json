@@ -1,0 +1,13 @@
+{
+  "name": "agent-control-web",
+  "version": "0.1.0",
+  "description": "AgentHQ setup wizard — local web UI",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "bun run server.ts"
+  },
+  "dependencies": {
+    "hono": "^4.7.0"
+  }
+}

@@ -68,5 +68,16 @@ for phase in bootstrap/[0-9][0-9]-*.sh; do
 done
 
 echo
-echo "[AgentHQ] Platform install complete."
-echo "Next:  sudo agent-control create <agent-name> --tools=tool1,tool2,..."
+echo "════════════════════════════════════════════════════════════════"
+echo " AgentHQ platform install complete."
+echo
+echo " Open the setup wizard in a browser on this box:"
+echo "   http://localhost:5000"
+echo
+echo " Or from another machine on the LAN, SSH-tunnel:"
+echo "   ssh -L 5000:localhost:5000 $(whoami)@$(hostname -I | awk '{print $1}')"
+echo "   then open  http://localhost:5000"
+echo
+echo " Power users can skip the wizard and use the CLI:"
+echo "   sudo agent-control create <name> --tools telegram --telegram-chat-id <N>"
+echo "════════════════════════════════════════════════════════════════"

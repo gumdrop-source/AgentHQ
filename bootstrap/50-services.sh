@@ -23,11 +23,20 @@ log "Installing agent-control → /usr/local/bin"
 install -m 0755 \
     "$(agenthq_root)/agent-control/agent-control" /usr/local/bin/agent-control
 
+# Web setup wizard
+log "Installing agent-control-web → /opt/agent-control-web"
+rm -rf /opt/agent-control-web
+mkdir -p /opt/agent-control-web
+rsync -a "$(agenthq_root)/agent-control-web/" /opt/agent-control-web/
+( cd /opt/agent-control-web && /usr/local/bin/bun install --silent )
+
 log "Installing systemd unit templates → /etc/systemd/system/"
 rsync -a "$src/" /etc/systemd/system/
 systemctl daemon-reload
 
-# Per-agent templated units (agent@.service) are NOT enabled here.
-# agent-control enables agent@<name>.service when it provisions an agent.
+# Enable + start the web wizard so install.sh's final line can point to it.
+# Per-agent templated units (agent@.service) are NOT enabled here — those
+# come up via agent-control / the web wizard at provisioning time.
+systemctl enable --now agent-control-web.service
 
 log "Phase 50 complete"

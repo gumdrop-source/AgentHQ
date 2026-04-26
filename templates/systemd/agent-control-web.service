@@ -1,0 +1,26 @@
+# AgentHQ — local-only setup wizard
+#
+# Runs as root on 127.0.0.1:5000 so the web flow can call agent-control,
+# agenthq-cred, and systemctl without an additional privilege bridge.
+# Bound to localhost only — access via SSH tunnel or browser on the box.
+
+[Unit]
+Description=AgentHQ — setup wizard (web UI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/agent-control-web
+Environment=PORT=5000
+ExecStart=/usr/local/bin/bun run /opt/agent-control-web/server.ts
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agent-control-web
+
+[Install]
+WantedBy=multi-user.target
