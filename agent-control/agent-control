@@ -174,7 +174,48 @@ cmd_create() {
 
     cp "$TEMPLATES/settings.json.tmpl" "$home/.claude/settings.json"
 
+    # 4a. Telegram allowlist — empty file means the bot ignores every message.
+    # When --telegram-chat-id was given, render an access.json so this chat
+    # can talk to the bot from the first message.
+    if [[ "$tools" == *"telegram"* && -n "$telegram_chat_id" ]]; then
+        log "Rendering telegram access.json (allowlist: $telegram_chat_id)"
+        sudo -u "$name" mkdir -p "$home/.claude/channels/telegram"
+        sudo -u "$name" tee "$home/.claude/channels/telegram/access.json" >/dev/null <<EOF
+{"dmPolicy":"allowlist","allowFrom":["$telegram_chat_id"],"groups":{},"pending":{}}
+EOF
+    fi
+
     chown -R "$name:$name" "$home/agent.toml" "$home/.claude.json" "$home/.claude"
+
+    # 4b. Authenticate claude. The binary is installed but has no Anthropic
+    # OAuth token, so without this step the bot would receive messages and
+    # silently fail when it tries to call the API. Prompt the user through
+    # an interactive `claude` session — they get a URL to open in a browser,
+    # paste the code back, then /exit. We then verify the credentials file
+    # was created.
+    if [[ -f "$home/.claude/.credentials.json" ]]; then
+        log "Claude already authenticated for $name — skipping login"
+    else
+        log "Authenticating claude as $name — interactive login required"
+        cat <<EOF
+
+────────────────────────────────────────────────────────────
+The next step is interactive. Claude will open a TUI and walk
+you through OAuth login (URL → browser → paste code back).
+
+When done, type  /exit  in claude (or press Ctrl-C twice) to
+return to this script. Press Enter to begin...
+────────────────────────────────────────────────────────────
+EOF
+        read -r _
+        sudo -i -u "$name" -- claude </dev/tty >/dev/tty 2>&1 || true
+        if [[ ! -f "$home/.claude/.credentials.json" ]]; then
+            log "WARNING: claude credentials.json still missing — login did not complete"
+            log "Service will fail to respond until you run: sudo -i -u $name claude"
+        else
+            log "Claude authenticated for $name"
+        fi
+    fi
 
     # 5. Systemd credential drop-in
     log "Writing systemd credential drop-in"
