@@ -919,6 +919,121 @@ app.get("/agent/:name/permissions", (c) => {
     `, "agents", c.get("user")));
 });
 
+// M365 device-flow OAuth — interactive sign-in driven from the web UI.
+// Server spawns auth.py as the agent user, parses its JSON events, and
+// streams them via SSE to the browser.
+app.get("/agent/:name/auth/m365", (c) => {
+    const name = c.req.param("name");
+    if (!/^[a-z][a-z0-9_-]{1,30}$/.test(name)) return c.html(errorPage("Invalid agent name"));
+
+    if (!existsSync("/etc/agents/credentials/m365_client_id.cred")) {
+        return c.html(errorPage("M365 not activated", `Activate the M365 integration first at <a href="/integrations/m365">Integrations → M365</a>.`));
+    }
+
+    const tokenCache = `/home/${name}/.m365_token_cache.json`;
+    if (existsSync(tokenCache)) {
+        return c.html(layout(`Authorize ${name} for M365`, card(`
+            ${pageHeader(`${escapeHtml(name)} is already signed in to Microsoft 365`, "Re-authorize only if the token has been revoked or you want to switch accounts.")}
+            <p class="text-sm text-emerald-700 mb-4">✓ Token cache present at <code>${escapeHtml(tokenCache)}</code></p>
+            <div class="flex gap-3">
+              ${button("Re-authorize", { href: `/agent/${name}/auth/m365?force=1`, intent: "secondary" })}
+              ${button("Back", { href: `/agent/${name}/permissions`, intent: "secondary" })}
+            </div>
+        `), "agents", c.get("user")));
+    }
+
+    return c.html(layout(`Authorize ${name} for M365`, `
+        <div class="mb-6">
+          <h1 class="text-2xl font-semibold tracking-tight">Authorize ${escapeHtml(name)} for Microsoft 365</h1>
+          <p class="text-slate-600 text-sm">One-time device-flow sign-in. ${escapeHtml(name)} will get its own refresh token; nothing shared with other agents.</p>
+        </div>
+        <div hx-ext="sse" sse-connect="/agent/${name}/auth/m365/stream" sse-close="done"
+             class="space-y-4">
+          <div id="auth-status" class="bg-white rounded-xl border border-slate-200 p-6 text-sm text-slate-600"
+               sse-swap="flow_started,success,error" hx-swap="innerHTML">
+            <p>Starting sign-in flow… (one moment)</p>
+          </div>
+        </div>
+    `, "agents", c.get("user")));
+});
+
+app.get("/agent/:name/auth/m365/stream", (c) => {
+    const name = c.req.param("name");
+    if (!/^[a-z][a-z0-9_-]{1,30}$/.test(name)) return c.text("invalid", 400);
+
+    return streamSSE(c, async (s) => {
+        const venvPython = "/opt/agents/tools/m365/.venv/bin/python";
+        const authScript = "/opt/agents/tools/m365/auth.py";
+
+        const child = spawn("sudo", ["-u", name, venvPython, authScript, "--json-flow"], {
+            env: { ...process.env, HOME: `/home/${name}` },
+        });
+
+        // Heartbeat
+        const heartbeat = setInterval(() => {
+            s.writeSSE({ event: "ping", data: "" }).catch(() => {});
+        }, 5000);
+
+        let buffer = "";
+        const handleLine = async (line: string) => {
+            line = line.trim();
+            if (!line) return;
+            try {
+                const evt = JSON.parse(line);
+                if (evt.event === "flow_started") {
+                    const html = `
+                        <h3 class="font-medium mb-3">Sign in to authorize ${escapeHtml(name)}</h3>
+                        <ol class="list-decimal list-inside space-y-2 text-slate-700 mb-4">
+                          <li>Open <a href="${escapeHtml(evt.verification_uri)}" target="_blank" rel="noopener" class="underline font-medium">${escapeHtml(evt.verification_uri)}</a> in a new tab</li>
+                          <li>Enter this code: <span class="ml-2 inline-block px-3 py-1.5 rounded font-mono text-lg bg-slate-900 text-white">${escapeHtml(evt.user_code)}</span></li>
+                          <li>Sign in to your Microsoft account</li>
+                          <li>Come back here — this page updates automatically</li>
+                        </ol>
+                        <p class="text-xs text-slate-500">Code expires in ${Math.floor((evt.expires_in ?? 0) / 60)} minutes.</p>
+                    `;
+                    await s.writeSSE({ event: "flow_started", data: html });
+                } else if (evt.event === "success") {
+                    const html = `
+                        <p class="text-emerald-700 font-medium mb-3">✓ ${escapeHtml(name)} authorized as ${escapeHtml(evt.user ?? "unknown")}</p>
+                        <p class="text-sm text-slate-600 mb-4">Token cache stored. Sign-in won't be needed again unless the token is revoked.</p>
+                        <div class="flex gap-2">
+                          <a href="/agent/${name}/permissions" class="inline-block px-4 py-2 rounded-lg font-medium bg-slate-900 text-white">Back to permissions</a>
+                        </div>
+                    `;
+                    await s.writeSSE({ event: "success", data: html });
+                } else if (evt.event === "error") {
+                    const html = `<p class="text-rose-700 font-medium">Sign-in failed: ${escapeHtml(evt.error ?? "")}</p>
+                        <a href="/agent/${name}/auth/m365" class="text-sm underline mt-2 inline-block">Try again</a>`;
+                    await s.writeSSE({ event: "error", data: html });
+                }
+            } catch {
+                // Non-JSON line, ignore
+            }
+        };
+
+        try {
+            for await (const chunk of child.stdout) {
+                buffer += chunk.toString();
+                const lines = buffer.split("\n");
+                buffer = lines.pop() ?? "";
+                for (const line of lines) await handleLine(line);
+            }
+            // Flush any trailing line
+            if (buffer) await handleLine(buffer);
+            // Drain stderr too (errors go there)
+            for await (const chunk of child.stderr) {
+                const text = chunk.toString();
+                console.error(`[m365 auth ${name}]`, text);
+            }
+        } finally {
+            clearInterval(heartbeat);
+        }
+
+        await new Promise((r) => child.on("close", r));
+        await s.writeSSE({ event: "done", data: "" });
+    });
+});
+
 app.post("/agent/:name/permissions", async (c) => {
     const name = c.req.param("name");
     if (!/^[a-z][a-z0-9_-]{1,30}$/.test(name)) return c.html(errorPage("Invalid agent name"));
