@@ -242,10 +242,15 @@ app.get("/setup/claude/:name", (c) => {
         ${ok
             ? `<p class="text-emerald-600 font-medium">✅ Already signed in.</p>
                <div class="mt-4">${button("Continue", { href: `/setup/token/${name}` })}</div>`
-            : `<p class="mb-3">Open a terminal on this box and run:</p>
-               ${code(`sudo -i -u ${name} claude`)}
-               <p class="my-3 text-sm text-slate-600">Claude will print a URL — open it in a browser, sign in to your Anthropic account, and paste the code back. Then type <code>/exit</code>.</p>
-               <p class="text-sm text-slate-500">This page checks every few seconds…</p>
+            : `<ol class="list-decimal list-inside text-sm text-slate-700 space-y-2 mb-4">
+                 <li>Open a terminal on this box and run:
+                   ${code(`sudo -i -u ${name} claude`)}
+                 </li>
+                 <li>Inside claude, type <code class="bg-slate-100 px-1 rounded">/login</code> and pick "Claude.ai login"</li>
+                 <li>Claude prints a URL — open it in a browser, sign in to your Anthropic account, paste the code back</li>
+                 <li>Type <code class="bg-slate-100 px-1 rounded">/exit</code> to leave claude</li>
+               </ol>
+               <p class="text-sm text-slate-500">This page auto-refreshes every few seconds…</p>
                <script>setTimeout(() => location.reload(), 4000)</script>`}
     `)));
 });
