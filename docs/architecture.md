@@ -89,11 +89,27 @@ them per-agent at provision time.
 Per-agent provisioning happens later via `agent-control create`,
 not as part of bootstrap.
 
+## Claude binary — per-agent install
+
+Decision: install claude **per agent**, not system-wide.
+
+Claude is a ~240 MB self-updating ELF that lives at
+`$HOME/.local/share/claude/versions/<X>/` with a symlink at
+`$HOME/.local/bin/claude`. Each agent runs the official installer at
+provision time (`agent-control create` does this), giving each agent
+its own copy.
+
+Why per-agent over shared `/opt/agents/bin/claude`:
+- Matches the official installer's design (no special prefix flags needed)
+- Claude self-update writes into `$HOME` — works without root
+- One agent's broken or mid-update claude can't take down others
+- Disk cost (~240 MB × N agents) is acceptable for a fleet of 2–10
+
+Phase 40 stages config templates only. The actual binary install is
+deferred to agent-control.
+
 ## Open questions
 
-- **Claude binary placement.** Per-agent npm install (current Alice
-  pattern) vs shared `/opt/agents/bin/claude` with per-agent config
-  dir. Shared is cleaner for upgrades; needs `--config-dir` support.
 - **TPM2 firmware gate.** Agents-01 currently runs Infineon SLB9670
   FW 7.62 (CVE-2025-2884). Bootstrap should detect FW version and
   refuse TPM2 mode below 7.86, falling back to host-key.

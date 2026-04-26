@@ -29,7 +29,7 @@ Environment=PATH=/home/%i/.local/bin:/usr/local/bin:/usr/bin:/bin
 # decrypted bot-token credential, plus any other one-shot setup.
 ExecStartPre=/opt/agents/bin/agent-prelaunch %i
 
-ExecStart=/usr/bin/script -qec "/opt/agents/bin/claude --channels plugin:telegram@claude-plugins-official" /dev/null
+ExecStart=/usr/bin/script -qec "/home/%i/.local/bin/claude --channels plugin:telegram@claude-plugins-official" /dev/null
 
 Restart=on-failure
 RestartSec=10
