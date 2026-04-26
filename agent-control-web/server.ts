@@ -889,6 +889,8 @@ app.get("/agent/:name/permissions", (c) => {
                 </div>`;
         }).join("");
 
+    const saved = c.req.query("saved") === "1";
+
     return c.html(layout(`${name} — permissions`, `
         <div class="flex items-center justify-between mb-6">
           <div>
@@ -898,11 +900,20 @@ app.get("/agent/:name/permissions", (c) => {
           ${button("Back to agent", { href: `/agent/${name}`, intent: "secondary" })}
         </div>
 
+        ${saved ? `
+          <div class="mb-4 px-4 py-3 rounded-lg bg-emerald-50 border border-emerald-200 text-sm text-emerald-800 flex items-center gap-2">
+            <span class="font-medium">✓ Saved.</span> ${escapeHtml(name)} restarted and is now using the new permission set.
+          </div>` : ""}
+
         <form method="POST" action="/agent/${name}/permissions">
           ${sections}
           ${integrations.length > 0 ? `
             <div class="flex gap-3 mt-6">
-              ${button("Save and restart agent")}
+              <button type="submit"
+                      onclick="this.disabled=true; this.textContent='Saving and restarting…'; this.form.submit()"
+                      class="inline-block px-4 py-2 rounded-lg font-medium bg-slate-900 text-white hover:bg-slate-700 disabled:opacity-60 disabled:cursor-wait">
+                Save and restart agent
+              </button>
               ${button("Cancel", { href: `/agent/${name}`, intent: "secondary" })}
             </div>
           ` : ""}
@@ -1086,7 +1097,7 @@ app.post("/agent/:name/permissions", async (c) => {
 
     // Restart agent so the new permission set is read
     spawnSync("systemctl", ["restart", `agent@${name}.service`]);
-    return c.redirect(`/agent/${name}/permissions`);
+    return c.redirect(`/agent/${name}/permissions?saved=1`);
 });
 
 function errorPage(title: string, detail = ""): string {
