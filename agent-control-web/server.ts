@@ -451,20 +451,97 @@ app.get("/integrations/:id", (c) => {
     `, "integrations", c.get("user")));
 });
 
-// TODO: GET /integrations/:id/activate — credential paste form
-// TODO: POST /integrations/:id/activate — agenthq-cred set + validation + mcp_servers row
-// TODO: GET /integrations/:id/configure — show stored creds (masked) + tool list + edit + deactivate
-app.get("/integrations/:id/activate", (c) => c.html(layout("Activate", card(`
-    ${pageHeader(`Activate ${escapeHtml(c.req.param("id"))}`, "Coming soon — paste credentials, validate, store in vault.")}
-    <p class="text-sm text-slate-500">For now, activate via CLI on the host:<br>
-       <code>sudo agenthq-cred set ${escapeHtml(c.req.param("id"))}_tenant_id</code> (etc, one per credential listed on the integration's detail page).</p>
-    <div class="mt-4">${button("Back", { href: `/integrations/${c.req.param("id")}`, intent: "secondary" })}</div>
-`), "integrations", c.get("user"))));
+// Helper — read manifest for an integration
+function loadManifest(id: string): any | null {
+    if (!/^[a-z][a-z0-9_-]*$/.test(id)) return null;
+    const toolsDir = process.env.AGENTHQ_TOOLS_DIR ?? "/opt/agents/tools";
+    const path = `${toolsDir}/${id}/tool.json`;
+    if (!existsSync(path)) return null;
+    try { return JSON.parse(readFileSync(path, "utf8")); } catch { return null; }
+}
 
-app.get("/integrations/:id/configure", (c) => c.html(layout("Configure", card(`
-    ${pageHeader(`Configure ${escapeHtml(c.req.param("id"))}`, "Coming soon — view/rotate credentials, deactivate.")}
-    <div class="mt-4">${button("Back", { href: `/integrations/${c.req.param("id")}`, intent: "secondary" })}</div>
-`), "integrations", c.get("user"))));
+app.get("/integrations/:id/activate", (c) => {
+    const id = c.req.param("id");
+    const m = loadManifest(id);
+    if (!m) return c.html(errorPage("No such integration"));
+    const credFields = (m.credentials ?? []).map((cred: any) => `
+        <div>
+          <label class="block text-sm font-medium mb-1">${escapeHtml(cred.label ?? cred.key)}${cred.secret ? " <span class='text-xs text-slate-400 font-normal'>(secret)</span>" : ""}</label>
+          <input name="${escapeHtml(cred.key)}" required ${cred.secret ? 'type="password"' : 'type="text"'} autocomplete="off"
+                 class="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm">
+          ${cred.description ? `<p class="text-xs text-slate-500 mt-1">${escapeHtml(cred.description)}</p>` : ""}
+        </div>
+    `).join("");
+    return c.html(layout(`Activate ${m.title ?? id}`, card(`
+        ${pageHeader(`Activate ${escapeHtml(m.title ?? id)}`, "Paste each credential below. They're encrypted into the systemd-creds vault and never logged.")}
+        <form method="POST" action="/integrations/${id}/activate" class="space-y-4">
+          ${credFields}
+          <div class="pt-2 flex gap-3">
+            ${button(`Activate ${escapeHtml(m.title ?? id)}`)}
+            ${button("Cancel", { href: `/integrations/${id}`, intent: "secondary" })}
+          </div>
+        </form>
+        <details class="mt-6">
+          <summary class="text-sm text-slate-600 cursor-pointer">Setup instructions</summary>
+          <pre class="whitespace-pre-wrap text-xs text-slate-600 mt-3">${escapeHtml(existsSync(`${process.env.AGENTHQ_TOOLS_DIR ?? "/opt/agents/tools"}/${id}/setup.md`) ? readFileSync(`${process.env.AGENTHQ_TOOLS_DIR ?? "/opt/agents/tools"}/${id}/setup.md`, "utf8") : "")}</pre>
+        </details>
+    `), "integrations", c.get("user")));
+});
+
+app.post("/integrations/:id/activate", async (c) => {
+    const id = c.req.param("id");
+    const m = loadManifest(id);
+    if (!m) return c.html(errorPage("No such integration"));
+
+    const body = await c.req.parseBody();
+    const errors: string[] = [];
+
+    for (const cred of (m.credentials ?? [])) {
+        const value = String(body[cred.key] ?? "").trim();
+        if (!value) {
+            errors.push(`Missing value for ${cred.key}`);
+            continue;
+        }
+        const r = spawnSync("/usr/local/bin/agenthq-cred", ["set", cred.key], {
+            input: value,
+            encoding: "utf8",
+        });
+        if (r.status !== 0) {
+            errors.push(`Failed to store ${cred.key}: ${r.stderr || r.stdout}`);
+        }
+    }
+
+    if (errors.length > 0) {
+        return c.html(errorPage(`Activation failed for ${id}`, errors.join("; ")));
+    }
+    return c.redirect(`/integrations/${id}`);
+});
+
+app.get("/integrations/:id/configure", (c) => {
+    const id = c.req.param("id");
+    const m = loadManifest(id);
+    if (!m) return c.html(errorPage("No such integration"));
+
+    const credList = (m.credentials ?? []).map((cred: any) => {
+        const stored = existsSync(`/etc/agents/credentials/${cred.key}.cred`);
+        return `<li class="flex items-center justify-between py-1.5 border-b border-slate-100 last:border-0">
+          <span class="font-mono text-sm">${escapeHtml(cred.key)}</span>
+          ${stored
+            ? `<span class="text-xs text-emerald-700">stored ✓</span>`
+            : `<span class="text-xs text-rose-600">missing</span>`}
+        </li>`;
+    }).join("");
+
+    return c.html(layout(`Configure ${m.title ?? id}`, card(`
+        ${pageHeader(`Configure ${escapeHtml(m.title ?? id)}`)}
+        <p class="text-sm text-slate-700 mb-3">Stored credentials (values not shown — they're encrypted in the vault):</p>
+        <ul class="mb-6">${credList}</ul>
+        <div class="flex gap-3">
+          <a href="/integrations/${id}/activate" class="inline-block px-4 py-2 rounded-lg font-medium bg-slate-100 text-slate-900 hover:bg-slate-200">Re-enter credentials</a>
+          ${button("Back", { href: `/integrations/${id}`, intent: "secondary" })}
+        </div>
+    `), "integrations", c.get("user")));
+});
 
 app.get("/updates", (c) => c.html(layout("Updates", card(`
     ${pageHeader("Updates", "Keep the platform and the claude binary current.")}
