@@ -52,10 +52,25 @@ fi
 apt-get update -qq
 apt-get install -y -qq git ca-certificates curl
 
-# Fetch the repo
-echo "[AgentHQ] Cloning $REPO_URL ($REPO_REF) → $INSTALL_DIR"
-rm -rf "$INSTALL_DIR"
-git clone --depth 1 --branch "$REPO_REF" "$REPO_URL" "$INSTALL_DIR"
+# Fetch the repo (only on first invocation — see self-update guard below)
+if [[ "${AGENTHQ_BOOTSTRAPPED:-}" != "1" ]]; then
+    echo "[AgentHQ] Cloning $REPO_URL ($REPO_REF) → $INSTALL_DIR"
+    rm -rf "$INSTALL_DIR"
+    git clone --depth 1 --branch "$REPO_REF" "$REPO_URL" "$INSTALL_DIR"
+
+    # Self-update: re-exec the freshly-cloned install.sh so subsequent phase
+    # logic AND the final summary message all come from the latest version.
+    # Without this, repeated runs from /opt/AgentHQ/install.sh keep using
+    # the old in-memory script for the trailing lines (the inode is still
+    # held even after rm -rf).
+    exec env AGENTHQ_BOOTSTRAPPED=1 \
+        AGENTHQ_REPO_URL="$REPO_URL" \
+        AGENTHQ_RAW_URL="$RAW_URL" \
+        AGENTHQ_REPO_REF="$REPO_REF" \
+        AGENTHQ_INSTALL_DIR="$INSTALL_DIR" \
+        AGENTHQ_LOCAL_SUBNET="${AGENTHQ_LOCAL_SUBNET:-}" \
+        bash "$INSTALL_DIR/install.sh"
+fi
 
 # Run phases in order
 cd "$INSTALL_DIR"
