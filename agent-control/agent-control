@@ -284,6 +284,18 @@ cmd_delete() {
     if (( purge )); then
         log "Removing user and home (purge)"
         userdel --remove "$name" 2>&1 | grep -v "mail spool" >&2 || true
+        # Also wipe agent-prefixed credentials from the vault so a later
+        # re-create can't silently use stale tokens. Shared creds (m365_*,
+        # hikvision_*, ha_token, myob_*) stay — they're not per-agent.
+        local creds_removed=0
+        for cred in /etc/agents/credentials/${name}_*.cred; do
+            [[ -f "$cred" ]] || continue
+            rm -f "$cred"
+            creds_removed=$((creds_removed + 1))
+        done
+        if (( creds_removed > 0 )); then
+            log "Removed $creds_removed per-agent credential(s) from vault"
+        fi
     else
         log "Removing user (home preserved at /home/$name — pass --purge to wipe)"
         userdel "$name"

@@ -292,7 +292,10 @@ app.post("/setup/token/:name", async (c) => {
     const r1 = spawnSync("/usr/local/bin/agenthq-cred", ["set", credName], { input: token, encoding: "utf8" });
     if (r1.status !== 0) return c.html(errorPage("Failed to store credential", r1.stderr || ""));
 
-    const r2 = spawnSync("systemctl", ["start", `agent@${name}.service`], { encoding: "utf8" });
+    // Restart (not start) so a service already running with the previous
+    // credential value picks up the new one. agent-control's create flow may
+    // have started the service eagerly if a stale cred was already in the vault.
+    const r2 = spawnSync("systemctl", ["restart", `agent@${name}.service`], { encoding: "utf8" });
     if (r2.status !== 0) return c.html(errorPage("Service failed to start", r2.stderr || ""));
 
     return c.redirect(`/agent/${name}`);
