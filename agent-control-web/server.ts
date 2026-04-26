@@ -813,9 +813,15 @@ app.post("/agent/:name/delete", (c) => {
     return c.redirect("/");
 });
 
-// Permissions matrix: read-only first cut. Reads the agent's settings.json
-// allow list, groups MCP entries by server, and decorates them with tool
-// metadata from /opt/agents/tools/<server>/tool.json (if present).
+// Editable per-agent permissions matrix.
+//
+// Lists every MCP server that's been ACTIVATED at the platform level
+// (i.e. has tool.json on disk + first credential in the vault) and shows
+// each tool as a checkbox. Submit POSTs the granted set; backend rewrites
+// the agent's settings.json permissions.allow and restarts the service.
+//
+// Built-in claude tools (Bash/Read/Write/etc) and plugin tools (telegram,
+// claude-mem) are always granted — they're how the agent talks and thinks.
 app.get("/agent/:name/permissions", (c) => {
     const name = c.req.param("name");
     if (!/^[a-z][a-z0-9_-]{1,30}$/.test(name)) return c.html(errorPage("Invalid agent name"));
@@ -829,99 +835,57 @@ app.get("/agent/:name/permissions", (c) => {
         return c.html(errorPage(`No settings.json for ${name}`, "Agent may not exist or wasn't provisioned by AgentHQ."));
     }
 
-    // Bucket the allow list:
-    //   builtin    Bash/Read/Write/etc — always granted, not editable
-    //   plugin     mcp__plugin_*       — always granted (telegram, claude-mem)
-    //   mcp        mcp__<server>__<tool> — per-server permissions
-    const builtins: string[] = [];
-    const plugins: Record<string, string[]> = {};
-    const mcp: Record<string, Set<string>> = {};
+    // Currently-granted MCP tools, by server
+    const granted: Record<string, Set<string>> = {};
     for (const entry of allow) {
-        if (!entry.startsWith("mcp__")) {
-            builtins.push(entry);
-            continue;
-        }
-        // mcp__<server>__<tool>  or  mcp__<server>__*
+        if (!entry.startsWith("mcp__") || entry.startsWith("mcp__plugin_")) continue;
         const m = entry.match(/^mcp__([^_]+(?:_[^_]+)*?)__(.+)$/);
         if (!m) continue;
         const [, server, tool] = m;
-        if (server.startsWith("plugin_")) {
-            plugins[server] ??= [];
-            plugins[server].push(tool);
-        } else {
-            mcp[server] ??= new Set();
-            mcp[server].add(tool);
-        }
+        granted[server] ??= new Set();
+        granted[server].add(tool);
     }
 
-    // Load tool manifests from /opt/agents/tools/*/tool.json so the matrix
-    // shows tool descriptions, marks destructive ones, etc.
-    const manifests: Record<string, any> = {};
-    try {
-        const toolsDir = "/opt/agents/tools";
-        for (const dir of readdirSync(toolsDir)) {
-            const path = `${toolsDir}/${dir}/tool.json`;
-            if (existsSync(path)) {
-                try { manifests[dir] = JSON.parse(readFileSync(path, "utf8")); } catch {}
-            }
-        }
-    } catch {}
+    // All ACTIVATED integrations (manifest + first cred in vault)
+    const integrations = listIntegrations().filter((it) => it.active);
 
-    // Render
-    const builtinList = builtins.length === 0
-        ? `<p class="text-sm text-slate-500 italic">none</p>`
-        : `<div class="flex flex-wrap gap-1.5">${builtins.map((b) =>
-            `<span class="inline-block px-2 py-0.5 rounded bg-slate-100 text-slate-700 text-xs font-mono">${escapeHtml(b)}</span>`
-          ).join("")}</div>`;
-
-    const pluginsList = Object.keys(plugins).length === 0
-        ? `<p class="text-sm text-slate-500 italic">none</p>`
-        : Object.entries(plugins).map(([server, tools]) => `
-            <div class="mb-3">
-              <p class="text-sm font-medium font-mono">${escapeHtml(server)}</p>
-              <div class="flex flex-wrap gap-1.5 mt-1">${tools.map((t) =>
-                `<span class="inline-block px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 text-xs font-mono">${escapeHtml(t)}</span>`
-              ).join("")}</div>
-            </div>`).join("");
-
-    const mcpServers = Object.keys(mcp).sort();
-    const mcpSection = mcpServers.length === 0
-        ? `<p class="text-sm text-slate-500 italic">No MCP integrations granted yet. Activate one in <a href="/integrations" class="underline">Integrations</a>, then return here to grant tools.</p>`
-        : mcpServers.map((server) => {
-            const granted = mcp[server];
-            const manifest = manifests[server];
-            const allTools = manifest?.tools ?? {};
-            const known = Object.keys(allTools);
-            const rows = known.length > 0
-                ? known.map((tool) => {
-                    const meta = allTools[tool] ?? {};
-                    const isGranted = granted.has(tool) || granted.has("*");
-                    const dot = isGranted ? "bg-emerald-500" : "bg-slate-200";
-                    const destructive = meta.destructive ? `<span class="ml-2 text-xs text-rose-600">⚠ destructive</span>` : "";
-                    return `
-                        <li class="flex items-center justify-between py-1.5 border-b border-slate-100 last:border-0">
-                          <div class="flex items-center gap-3">
-                            <span class="w-2 h-2 rounded-full ${dot}"></span>
-                            <span class="font-mono text-sm">${escapeHtml(tool)}</span>
-                            ${destructive}
-                          </div>
-                          <span class="text-xs text-slate-500">${escapeHtml(meta.description ?? "")}</span>
-                        </li>`;
-                  }).join("")
-                : Array.from(granted).map((tool) => `
-                    <li class="flex items-center gap-3 py-1.5 border-b border-slate-100 last:border-0">
-                      <span class="w-2 h-2 rounded-full bg-emerald-500"></span>
-                      <span class="font-mono text-sm">${escapeHtml(tool)}</span>
-                      <span class="text-xs text-slate-400">(no manifest)</span>
-                    </li>`).join("");
+    const sections = integrations.length === 0
+        ? `<div class="bg-white rounded-xl border border-slate-200 p-6 text-sm text-slate-600">
+             No integrations activated yet. Visit <a href="/integrations" class="underline">Integrations</a>, activate one (M365, etc), then come back to grant tools to this agent.
+           </div>`
+        : integrations.map((it) => {
+            const m = loadManifest(it.id);
+            const tools = (m?.tools ?? {}) as Record<string, any>;
+            const grants = granted[it.id] ?? new Set();
+            const checkboxes = Object.entries(tools).map(([toolName, meta]) => {
+                const checked = grants.has(toolName) ? "checked" : "";
+                const destructive = meta.destructive ? `<span class="ml-2 text-xs text-rose-600">⚠ destructive</span>` : "";
+                return `
+                    <label class="flex items-start gap-3 py-2 border-b border-slate-100 last:border-0 cursor-pointer hover:bg-slate-50 -mx-2 px-2 rounded">
+                      <input type="checkbox" name="grant" value="${escapeHtml(it.id)}__${escapeHtml(toolName)}" ${checked}
+                             class="mt-1 w-4 h-4 rounded border-slate-300 text-slate-900 focus:ring-slate-400">
+                      <div class="flex-1">
+                        <div class="flex items-center justify-between">
+                          <span class="font-mono text-sm font-medium">${escapeHtml(toolName)}</span>
+                          ${destructive}
+                        </div>
+                        <p class="text-xs text-slate-500">${escapeHtml(meta.description ?? "")}</p>
+                      </div>
+                    </label>`;
+            }).join("");
             return `
                 <div class="bg-white rounded-xl border border-slate-200 p-5 mb-4">
-                  <div class="flex items-baseline justify-between mb-2">
-                    <h3 class="font-medium">${escapeHtml(manifest?.title ?? server)}</h3>
-                    <span class="text-xs text-slate-500 font-mono">${escapeHtml(server)}</span>
+                  <div class="flex items-baseline justify-between mb-3">
+                    <div>
+                      <h3 class="font-medium">${escapeHtml(it.title)}</h3>
+                      <p class="text-xs text-slate-500 font-mono">${escapeHtml(it.id)}</p>
+                    </div>
+                    <div class="flex gap-2">
+                      <button type="button" onclick="this.closest('.bg-white').querySelectorAll('input[type=checkbox]').forEach(c => c.checked = true)" class="text-xs text-slate-600 hover:text-slate-900">All</button>
+                      <button type="button" onclick="this.closest('.bg-white').querySelectorAll('input[type=checkbox]').forEach(c => c.checked = false)" class="text-xs text-slate-600 hover:text-slate-900">None</button>
+                    </div>
                   </div>
-                  ${manifest?.description ? `<p class="text-sm text-slate-600 mb-3">${escapeHtml(manifest.description)}</p>` : ""}
-                  <ul>${rows}</ul>
+                  <div>${checkboxes}</div>
                 </div>`;
         }).join("");
 
@@ -929,28 +893,84 @@ app.get("/agent/:name/permissions", (c) => {
         <div class="flex items-center justify-between mb-6">
           <div>
             <h1 class="text-2xl font-semibold tracking-tight">${escapeHtml(name)} permissions</h1>
-            <p class="text-slate-600 text-sm">What this agent is allowed to do.</p>
+            <p class="text-slate-600 text-sm">Tick the tools this agent is allowed to use. Saving restarts the agent so changes take effect.</p>
           </div>
           ${button("Back to agent", { href: `/agent/${name}`, intent: "secondary" })}
         </div>
 
-        <div class="bg-white rounded-xl border border-slate-200 p-5 mb-4">
-          <h3 class="font-medium mb-2">Always granted</h3>
-          <p class="text-xs text-slate-500 mb-3">Built-in tools and plugin tools — every agent gets these.</p>
-          <p class="text-sm font-medium mt-2 mb-1">Built-ins</p>
-          ${builtinList}
-          <p class="text-sm font-medium mt-3 mb-1">Plugin tools</p>
-          ${pluginsList}
-        </div>
+        <form method="POST" action="/agent/${name}/permissions">
+          ${sections}
+          ${integrations.length > 0 ? `
+            <div class="flex gap-3 mt-6">
+              ${button("Save and restart agent")}
+              ${button("Cancel", { href: `/agent/${name}`, intent: "secondary" })}
+            </div>
+          ` : ""}
+        </form>
 
-        <h2 class="text-lg font-medium mb-3 mt-6">MCP integrations</h2>
-        ${mcpSection}
-
-        <p class="text-xs text-slate-500 mt-6">
-          Editable matrix coming soon. For now this is read-only —
-          edit <code>/home/${escapeHtml(name)}/.claude/settings.json</code> directly and restart the service.
-        </p>
+        <details class="mt-8 text-sm">
+          <summary class="text-slate-600 cursor-pointer">Always-granted tools (built-ins + plugins)</summary>
+          <div class="mt-3 text-xs text-slate-500">
+            <p class="mb-2">Every agent gets the following without configuration:</p>
+            <p class="mb-1"><strong>Built-ins:</strong> Bash, Edit, Write, Glob, Grep, Read, WebSearch, WebFetch</p>
+            <p><strong>Plugins:</strong> telegram (reply, react, edit_message, download_attachment), claude-mem</p>
+          </div>
+        </details>
     `, "agents", c.get("user")));
+});
+
+app.post("/agent/:name/permissions", async (c) => {
+    const name = c.req.param("name");
+    if (!/^[a-z][a-z0-9_-]{1,30}$/.test(name)) return c.html(errorPage("Invalid agent name"));
+
+    const settingsPath = `/home/${name}/.claude/settings.json`;
+    let settings: any;
+    try {
+        settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+    } catch {
+        return c.html(errorPage("Agent settings.json missing"));
+    }
+
+    const body = await c.req.parseBody({ all: true });
+    const raw = body["grant"];
+    const grants: string[] = Array.isArray(raw) ? raw.map(String) : raw ? [String(raw)] : [];
+
+    // Existing allow list, minus any mcp__<integration>__<tool> entries we'll
+    // re-derive from the form. Keep built-ins and plugin entries untouched.
+    const integrations = listIntegrations().filter((it) => it.active);
+    const managedIds = new Set(integrations.map((it) => it.id));
+    const existing: string[] = settings?.permissions?.allow ?? [];
+    const kept = existing.filter((entry: string) => {
+        if (!entry.startsWith("mcp__") || entry.startsWith("mcp__plugin_")) return true;
+        const m = entry.match(/^mcp__([^_]+(?:_[^_]+)*?)__/);
+        if (!m) return true;
+        return !managedIds.has(m[1]);
+    });
+
+    const added: string[] = [];
+    for (const g of grants) {
+        const [server, ...rest] = g.split("__");
+        if (!server || rest.length === 0) continue;
+        if (!managedIds.has(server)) continue; // silently ignore tampering
+        added.push(`mcp__${server}__${rest.join("__")}`);
+    }
+
+    settings.permissions ??= {};
+    settings.permissions.allow = [...new Set([...kept, ...added])];
+
+    try {
+        const tmp = `${settingsPath}.tmp`;
+        require("node:fs").writeFileSync(tmp, JSON.stringify(settings, null, 2), { encoding: "utf8" });
+        require("node:fs").renameSync(tmp, settingsPath);
+        require("node:fs").chownSync?.(settingsPath, ...[]); // best-effort, may not be available
+    } catch (e) {
+        return c.html(errorPage("Failed to write settings.json", String(e)));
+    }
+    spawnSync("/bin/chown", [`${name}:${name}`, settingsPath]);
+
+    // Restart agent so the new permission set is read
+    spawnSync("systemctl", ["restart", `agent@${name}.service`]);
+    return c.redirect(`/agent/${name}/permissions`);
 });
 
 function errorPage(title: string, detail = ""): string {
