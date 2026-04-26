@@ -109,7 +109,12 @@ const button = (text: string, opts: { href?: string; type?: string; intent?: "pr
     return `<button type="${opts.type ?? "submit"}" class="inline-block px-4 py-2 rounded-lg font-medium ${cls}">${text}</button>`;
 };
 
-const code = (s: string) => `<pre class="bg-slate-100 rounded-lg p-3 text-sm font-mono overflow-x-auto">${escapeHtml(s)}</pre>`;
+const code = (s: string) => `<div class="relative">
+  <pre class="bg-slate-100 rounded-lg p-3 pr-20 text-sm font-mono overflow-x-auto whitespace-pre">${escapeHtml(s)}</pre>
+  <button type="button"
+          onclick="(async (b) => { try { await navigator.clipboard.writeText(b.previousElementSibling.textContent); b.textContent = 'Copied!'; setTimeout(() => b.textContent = 'Copy', 1500); } catch (e) { b.textContent = 'Failed'; } })(this)"
+          class="absolute top-2 right-2 px-2 py-1 text-xs font-medium bg-white border border-slate-300 rounded hover:bg-slate-50 active:bg-slate-100">Copy</button>
+</div>`;
 
 function escapeHtml(s: string): string {
     return s.replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]!);
