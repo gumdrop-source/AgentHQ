@@ -19,6 +19,10 @@ log "Installing agent-prelaunch → /opt/agents/bin"
 install -m 0755 -o root -g agents \
     "$(agenthq_root)/bin/agent-prelaunch" /opt/agents/bin/agent-prelaunch
 
+log "Installing agent-control → /usr/local/bin"
+install -m 0755 \
+    "$(agenthq_root)/agent-control/agent-control" /usr/local/bin/agent-control
+
 log "Installing systemd unit templates → /etc/systemd/system/"
 rsync -a "$src/" /etc/systemd/system/
 systemctl daemon-reload
