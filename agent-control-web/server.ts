@@ -1074,13 +1074,14 @@ app.post("/agent/:name/permissions", async (c) => {
     settings.permissions.allow = [...new Set([...kept, ...added])];
 
     try {
+        const fs = await import("node:fs");
         const tmp = `${settingsPath}.tmp`;
-        require("node:fs").writeFileSync(tmp, JSON.stringify(settings, null, 2), { encoding: "utf8" });
-        require("node:fs").renameSync(tmp, settingsPath);
-        require("node:fs").chownSync?.(settingsPath, ...[]); // best-effort, may not be available
+        fs.writeFileSync(tmp, JSON.stringify(settings, null, 2), { encoding: "utf8" });
+        fs.renameSync(tmp, settingsPath);
     } catch (e) {
         return c.html(errorPage("Failed to write settings.json", String(e)));
     }
+    // Re-set ownership to the agent — atomic write may have left it root-owned
     spawnSync("/bin/chown", [`${name}:${name}`, settingsPath]);
 
     // Restart agent so the new permission set is read
