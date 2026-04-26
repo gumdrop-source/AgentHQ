@@ -7,7 +7,7 @@
 // Runtime: bun. Started by /etc/systemd/system/agent-control-web.service.
 
 import { Hono } from "hono";
-import { stream } from "hono/streaming";
+import { streamSSE } from "hono/streaming";
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
 
@@ -178,7 +178,7 @@ app.get("/setup/agent/stream", (c) => {
     const chatId = c.req.query("chat_id") ?? "";
     if (!/^[a-z][a-z0-9_-]{1,30}$/.test(name)) return c.text("invalid name", 400);
 
-    return stream(c, async (s) => {
+    return streamSSE(c, async (s) => {
         s.writeSSE({ event: "line", data: `[wizard] starting agent-control create ${name}\n` });
         // The systemd service runs as root, so we invoke agent-control directly.
         // AGENTHQ_SKIP_CLAUDE_LOGIN tells it to defer the OAuth step — the
