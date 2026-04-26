@@ -526,6 +526,7 @@ app.get("/agent/:name", (c) => {
           <div class="flex gap-2">
             ${button("Permissions", { href: `/agent/${name}/permissions`, intent: "secondary" })}
             ${button("Refresh", { href: `/agent/${name}`, intent: "secondary" })}
+            <a href="/agent/${name}/delete" class="inline-block px-4 py-2 rounded-lg font-medium bg-rose-50 text-rose-700 hover:bg-rose-100 border border-rose-200">Delete</a>
           </div>
         </div>
         ${card(`
@@ -533,6 +534,38 @@ app.get("/agent/:name", (c) => {
           <p class="mt-4 text-sm text-slate-600">If status is <code>active (running)</code>, message your bot in Telegram. It should reply.</p>
         `)}
     `, "agents", c.get("user")));
+});
+
+// Delete confirmation page — never delete on a GET. Form posts to /delete
+// which actually removes the agent + purges its home and credentials.
+app.get("/agent/:name/delete", (c) => {
+    const name = c.req.param("name");
+    if (!/^[a-z][a-z0-9_-]{1,30}$/.test(name)) return c.html(errorPage("Invalid agent name"));
+    return c.html(layout(`Delete ${name}`, card(`
+        ${pageHeader(`Delete agent ${escapeHtml(name)}?`, "This action cannot be undone.")}
+        <p class="text-sm text-slate-700 mb-2">The following will be removed:</p>
+        <ul class="list-disc list-inside text-sm text-slate-600 space-y-1 mb-6">
+          <li>Linux user <code>${escapeHtml(name)}</code> and the home directory <code>/home/${escapeHtml(name)}</code></li>
+          <li>The agent's claude install, memory, conv_log — everything under that home</li>
+          <li>The systemd unit drop-in <code>/etc/systemd/system/agent@${escapeHtml(name)}.service.d</code></li>
+          <li>Per-agent credentials in <code>/etc/agents/credentials/${escapeHtml(name)}_*.cred</code></li>
+        </ul>
+        <p class="text-sm text-slate-600 mb-4">Shared credentials (m365, ha, hikvision, etc) are kept — those belong to the platform.</p>
+        <form method="POST" action="/agent/${name}/delete" class="flex gap-3">
+          <button type="submit" class="px-4 py-2 rounded-lg font-medium bg-rose-600 text-white hover:bg-rose-700">Yes, delete ${escapeHtml(name)}</button>
+          ${button("Cancel", { href: `/agent/${name}`, intent: "secondary" })}
+        </form>
+    `), "agents", c.get("user")));
+});
+
+app.post("/agent/:name/delete", (c) => {
+    const name = c.req.param("name");
+    if (!/^[a-z][a-z0-9_-]{1,30}$/.test(name)) return c.html(errorPage("Invalid agent name"));
+    const r = spawnSync("/usr/local/bin/agent-control", ["delete", name, "--purge"], { encoding: "utf8" });
+    if (r.status !== 0) {
+        return c.html(errorPage(`Failed to delete ${name}`, r.stderr || r.stdout || ""));
+    }
+    return c.redirect("/");
 });
 
 // Permissions matrix: read-only first cut. Reads the agent's settings.json
