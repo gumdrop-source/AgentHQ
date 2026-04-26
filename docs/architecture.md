@@ -177,6 +177,65 @@ Why per-agent over shared `/opt/agents/bin/claude`:
 Phase 40 stages config templates only. The actual binary install is
 deferred to agent-control.
 
+## Connectors: AgentHQ owns its integrations
+
+AgentHQ deliberately does NOT use Anthropic-hosted account-level
+connectors (e.g. `mcp__claude_ai_Microsoft_365__*`,
+`mcp__claude_ai_Gmail__*`). They look convenient — tick a checkbox at
+claude.ai and every claude session signed into that account inherits
+the connector — but they bypass the per-agent isolation that's central
+to AgentHQ's design.
+
+**The problem with account-level connectors**
+
+A single Anthropic account login on multiple agents means every agent
+inherits every connector that account has enabled. If an admin
+authenticates Daisy, Allen, and Bob with one Anthropic account and
+that account has the M365 connector enabled, all three agents have
+access to the same M365 mailbox — *whoever's mailbox the account is
+linked to*. The vault, the per-agent permission matrix, the
+agent-prefixed credentials — none of it gates Anthropic-hosted
+connectors. They're managed entirely by Anthropic.
+
+This was discovered during testing: a fresh `testbot` agent with no
+local M365 setup was nonetheless able to read the operator's real
+inbox, because testbot's claude was signed into the operator's
+Anthropic account and that account had M365 connected at claude.ai.
+
+**The decision**
+
+For any service where AgentHQ provides per-agent isolation
+(per-tenant, per-user, per-mailbox), build the connector inside
+AgentHQ:
+
+- Tool manifest at `tools/<name>/tool.json`
+- MCP server at `tools/<name>/server.py` (or `server.ts`)
+- Credentials in `/etc/agents/credentials/<key>.cred`
+  (vault, per-agent prefixed where appropriate)
+- Per-agent OAuth via the in-conversation device flow
+  (`tools/<name>/auth.py` driven by `agent-control-web`'s wizard)
+- Granted per agent via the permission matrix
+
+Anthropic-hosted connectors are explicitly avoided. To enforce this
+on each AgentHQ host:
+
+- Operator disconnects all M365/Gmail/etc connectors at
+  <https://claude.ai/settings/connectors>
+- Each agent's `settings.json` lists the AgentHQ-managed MCP servers
+  it's allowed to call; nothing else (no `mcp__claude_ai_*` entries)
+- Future: bake a `disableAccountConnectors: true` (or equivalent
+  claude-code setting) into the agent template
+
+**When account-level connectors are fine**
+
+- A single-user setup where the operator is the only person, and
+  doesn't care that any spawned agent inherits the same connectors.
+- Personal-use Alice running on the operator's own mailbox.
+
+For multi-tenant — Daisy in accounts, Allen in sales, etc. — the
+account-level model breaks down and AgentHQ-owned connectors are the
+only correct path.
+
 ## Open questions
 
 - **TPM2 firmware gate.** Agents-01 currently runs Infineon SLB9670
@@ -184,3 +243,6 @@ deferred to agent-control.
   refuse TPM2 mode below 7.86, falling back to host-key.
 - **agent-control** — port the existing prototype at
   `/home/alice/agent-control/` or rewrite cleanly inside AgentHQ?
+- **Programmatic connector disabling** — is there a claude-code
+  setting that disables account-level connectors per agent? If yes,
+  AgentHQ should set it on every agent template by default.
