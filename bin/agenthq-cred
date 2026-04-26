@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# agenthq-cred — manage the AgentHQ systemd-creds vault
+#
+# Usage:
+#   agenthq-cred set <name>          read value from stdin, encrypt, store
+#   agenthq-cred set <name> <file>   read value from file, encrypt, store
+#   agenthq-cred list                list credential names (no values)
+#   agenthq-cred remove <name>       delete a credential
+#   agenthq-cred show <name>         decrypt and print to stdout (audit / debug)
+#
+# Storage: /etc/agents/credentials/<name>.cred
+# Method:  /etc/agents/credentials/.method controls TPM2 vs host-key (set by Phase 20)
+#
+# Tools and systemd units consume credentials via:
+#   LoadCredentialEncrypted=mycred:/etc/agents/credentials/mycred.cred
+# which decrypts at service start into $CREDENTIALS_DIRECTORY/mycred.
+
+set -euo pipefail
+
+VAULT=/etc/agents/credentials
+METHOD_FILE="$VAULT/.method"
+
+die() { echo "agenthq-cred: $*" >&2; exit 1; }
+
+require_root() {
+    [[ $EUID -eq 0 ]] || die "must run as root (use sudo)"
+}
+
+get_method() {
+    [[ -f "$METHOD_FILE" ]] || die "vault not initialised — run AgentHQ install or Phase 20"
+    cat "$METHOD_FILE"
+}
+
+cmd_set() {
+    local name="${1:-}"
+    local source="${2:--}"   # default to stdin
+    [[ -n "$name" ]] || die "usage: agenthq-cred set <name> [file]"
+    [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || die "invalid name (use [A-Za-z0-9_-])"
+
+    local method
+    method="$(get_method)"
+
+    local input
+    if [[ "$source" == "-" ]]; then
+        input="$(cat)"
+    else
+        [[ -r "$source" ]] || die "cannot read $source"
+        input="$(cat "$source")"
+    fi
+
+    local out="$VAULT/$name.cred"
+    case "$method" in
+        tpm2)
+            printf '%s' "$input" | systemd-creds encrypt --with-key=tpm2 --name="$name" - "$out"
+            ;;
+        host)
+            printf '%s' "$input" | systemd-creds encrypt --with-key=host --name="$name" - "$out"
+            ;;
+        *)
+            die "unknown method '$method' in $METHOD_FILE"
+            ;;
+    esac
+    chmod 0600 "$out"
+    chown root:root "$out"
+    echo "stored: $name (method=$method)"
+}
+
+cmd_list() {
+    [[ -d "$VAULT" ]] || die "vault not initialised"
+    local count=0
+    for f in "$VAULT"/*.cred; do
+        [[ -e "$f" ]] || continue
+        basename "$f" .cred
+        count=$((count + 1))
+    done
+    if (( count == 0 )); then
+        echo "(no credentials stored)"
+    fi
+}
+
+cmd_remove() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "usage: agenthq-cred remove <name>"
+    local out="$VAULT/$name.cred"
+    [[ -f "$out" ]] || die "no such credential: $name"
+    rm -f "$out"
+    echo "removed: $name"
+}
+
+cmd_show() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "usage: agenthq-cred show <name>"
+    local out="$VAULT/$name.cred"
+    [[ -f "$out" ]] || die "no such credential: $name"
+    systemd-creds decrypt --name="$name" "$out" -
+}
+
+case "${1:-}" in
+    set)    shift; cmd_set "$@" ;;
+    list)   shift; cmd_list "$@" ;;
+    remove) shift; cmd_remove "$@" ;;
+    show)   shift; cmd_show "$@" ;;
+    ""|-h|--help)
+        sed -n '2,/^$/p' "$0" | sed 's/^# \?//'
+        ;;
+    *)
+        die "unknown command: $1 (try --help)"
+        ;;
+esac

@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# agent-prelaunch — invoked by agent@.service ExecStartPre as the agent user
+#
+# Responsibilities:
+#   1. Materialise the telegram plugin's .env from the systemd-loaded
+#      bot-token credential (~/.claude/channels/telegram/.env).
+#   2. Any other one-shot per-launch setup that needs the agent's $HOME
+#      and the just-decrypted credentials in $CREDENTIALS_DIRECTORY.
+#
+# Runs under systemd, so:
+#   $CREDENTIALS_DIRECTORY contains decrypted creds (read-only, in-memory).
+#   $HOME is set to the agent's home.
+#   Failure here means the unit fails to start.
+
+set -euo pipefail
+
+agent="${1:-${USER:-}}"
+[[ -n "$agent" ]] || { echo "agent-prelaunch: no agent name" >&2; exit 1; }
+
+log() { echo "[agent-prelaunch:$agent] $*"; }
+
+# 1. Telegram plugin .env
+tg_token_cred="${CREDENTIALS_DIRECTORY:-}/telegram_bot_token"
+if [[ -r "$tg_token_cred" ]]; then
+    tg_dir="$HOME/.claude/channels/telegram"
+    install -d -m 0700 "$tg_dir"
+    {
+        printf 'TELEGRAM_BOT_TOKEN=%s\n' "$(cat "$tg_token_cred")"
+    } > "$tg_dir/.env"
+    chmod 0600 "$tg_dir/.env"
+    log "wrote $tg_dir/.env"
+else
+    log "no telegram_bot_token credential — skipping .env materialise"
+fi
+
+# Future per-launch hooks go here. Keep them idempotent and fast —
+# they run on every restart of agent@<name>.service.

@@ -35,4 +35,17 @@ chmod 0600 "$method_file"
 #   agenthq-cred remove <name>   deletes a cred
 # Tools/units reference creds by name via systemd LoadCredentialEncrypted=
 
+# Install agenthq-cred helper
+log "Installing agenthq-cred → /usr/local/bin"
+install -m 0755 "$(agenthq_root)/bin/agenthq-cred" /usr/local/bin/agenthq-cred
+
+# Smoke-test: encrypt + decrypt a sentinel value, then remove it
+log "Smoke-testing vault round-trip"
+sentinel="agenthq-vault-smoketest-$(date +%s)"
+echo "$sentinel" | /usr/local/bin/agenthq-cred set _smoketest >/dev/null
+got="$(/usr/local/bin/agenthq-cred show _smoketest)"
+[[ "$got" == "$sentinel" ]] || die "vault smoke-test failed (got: $got)"
+/usr/local/bin/agenthq-cred remove _smoketest >/dev/null
+log "Vault round-trip OK"
+
 log "Phase 20 complete (vault initialised, no secrets stored — use agenthq-cred to inject)"

@@ -12,16 +12,18 @@ require_root
 src="$(agenthq_root)/templates/systemd"
 
 if [[ ! -d "$src" ]]; then
-    log "No systemd templates yet (templates/systemd/ missing) — skipping"
-    log "Phase 50 complete (no-op)"
-    exit 0
+    die "templates/systemd/ missing — repo is broken"
 fi
+
+log "Installing agent-prelaunch → /opt/agents/bin"
+install -m 0755 -o root -g agents \
+    "$(agenthq_root)/bin/agent-prelaunch" /opt/agents/bin/agent-prelaunch
 
 log "Installing systemd unit templates → /etc/systemd/system/"
 rsync -a "$src/" /etc/systemd/system/
 systemctl daemon-reload
 
-# TODO: enable the platform-level services (agent-control), but NOT per-agent
-# templated units (those get enabled by agent-control on demand).
+# Per-agent templated units (agent@.service) are NOT enabled here.
+# agent-control enables agent@<name>.service when it provisions an agent.
 
 log "Phase 50 complete"

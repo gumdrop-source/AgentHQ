@@ -1,0 +1,41 @@
+# AgentHQ — base agent service (templated)
+#
+# Instance name (%i) is the agent's Linux username.
+# Per-agent credential loads + tool-specific tweaks go in drop-ins under:
+#   /etc/systemd/system/agent@<name>.service.d/
+# managed by agent-control at provisioning time.
+#
+# Why script(1)? claude detects whether stdin is a tty and falls back to a
+# non-interactive mode without one. Wrapping in `script -qec ...` gives it
+# a pty so the channels plugin (which spawns bun for Telegram polling)
+# behaves correctly.
+
+[Unit]
+Description=AgentHQ — %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+WorkingDirectory=/home/%i
+Environment=HOME=/home/%i
+# /usr/local/bin must be on PATH or the telegram plugin can't find bun.
+# This was the first silent blocker on the 2026-04-25 Alice cutover.
+Environment=PATH=/home/%i/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+# Per-agent prelaunch: writes the telegram plugin's .env from the
+# decrypted bot-token credential, plus any other one-shot setup.
+ExecStartPre=/opt/agents/bin/agent-prelaunch %i
+
+ExecStart=/usr/bin/script -qec "/opt/agents/bin/claude --channels plugin:telegram@claude-plugins-official" /dev/null
+
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agent@%i
+
+[Install]
+WantedBy=multi-user.target
