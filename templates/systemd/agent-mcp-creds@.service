@@ -1,0 +1,62 @@
+# AgentHQ — credential decryption service for the trusted MCP peer (templated)
+#
+# Instance name (%i) is the AGENT'S Linux username — NOT the -mcp peer's.
+# The unit runs as %i-mcp so the runtime dir + decrypted creds are owned
+# by the trusted peer, not by the agent (which is the untrusted side).
+#
+# Per-agent credential loads live in a drop-in:
+#   /etc/systemd/system/agent-mcp-creds@<agent>.service.d/credentials.conf
+# managed by agent-control at provisioning time.
+#
+# Why oneshot+RemainAfterExit:
+#   The service's only job is to materialise creds into /run/agents/%i-mcp/
+#   and exit. Marking it RemainAfterExit=yes lets agent@%i.service depend
+#   on it via Requires=/After= and treat "creds installed" as a started
+#   state rather than a one-shot trigger that's already gone.
+#
+# Why RuntimeDirectoryPreserve=restart:
+#   Without this, restarting the unit removes /run/agents/%i-mcp/ — and
+#   the launcher can't find the creds on the next invocation.
+
+[Unit]
+Description=AgentHQ — credential decryption for %i (paired-user model)
+Documentation=file:///opt/AgentHQ/docs/architecture.md
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=%i-mcp
+Group=%i-mcp
+
+# RuntimeDirectory= is rooted at /run, so this becomes /run/agents/%i-mcp/.
+# Mode 0700 + ownership by %i-mcp blocks the agent user from reading it.
+RuntimeDirectory=agents/%i-mcp
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=restart
+
+# Hardening: this service only reads decrypted creds from the systemd
+# tmpfs and writes them to RuntimeDirectory. Lock everything else down.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+ExecStart=/opt/agents/bin/agent-mcp-creds-install
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agent-mcp-creds@%i
+
+[Install]
+WantedBy=multi-user.target
