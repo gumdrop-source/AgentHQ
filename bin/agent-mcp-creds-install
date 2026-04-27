@@ -15,6 +15,11 @@
 # RuntimeDirectoryPreserve=restart on the unit means this dir survives
 # the service exiting. Without that, every restart of the service would
 # wipe the runtime dir before the next launcher invocation.
+#
+# Zero-credentials case: when the agent's tool set declares no MCP creds
+# (e.g. --tools telegram, where the bot token loads into agent@ directly),
+# systemd starts the unit with no $CREDENTIALS_DIRECTORY set. We still
+# create the runtime dir and exit 0 so agent@ can proceed.
 
 set -euo pipefail
 
@@ -22,8 +27,7 @@ LOG_TAG="agent-mcp-creds-install"
 log() { echo "[$LOG_TAG] $*" >&2; }
 die() { echo "$LOG_TAG: $*" >&2; exit 1; }
 
-[[ -n "${CREDENTIALS_DIRECTORY:-}" ]] || die "CREDENTIALS_DIRECTORY unset — is this running under systemd?"
-[[ -n "${RUNTIME_DIRECTORY:-}"     ]] || die "RUNTIME_DIRECTORY unset — RuntimeDirectory= missing on the unit?"
+[[ -n "${RUNTIME_DIRECTORY:-}" ]] || die "RUNTIME_DIRECTORY unset — is this running under systemd?"
 
 me="$(id -un)"
 [[ "$me" == *-mcp ]] || die "must run as a *-mcp user, got '$me'"
@@ -33,12 +37,14 @@ install -d -m 0700 -o "$me" -g "$me" "$dst"
 
 shopt -s nullglob
 count=0
-for src in "$CREDENTIALS_DIRECTORY"/*; do
-    [[ -f "$src" ]] || continue
-    name="$(basename "$src")"
-    install -m 0400 -o "$me" -g "$me" "$src" "$dst/$name"
-    count=$((count + 1))
-done
+if [[ -n "${CREDENTIALS_DIRECTORY:-}" ]]; then
+    for src in "$CREDENTIALS_DIRECTORY"/*; do
+        [[ -f "$src" ]] || continue
+        name="$(basename "$src")"
+        install -m 0400 -o "$me" -g "$me" "$src" "$dst/$name"
+        count=$((count + 1))
+    done
+fi
 shopt -u nullglob
 
 log "$me: installed $count credential(s) → $dst"
