@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# agent-mcp-creds-install — copy decrypted creds into the runtime dir
+#
+# Invoked by agent-mcp-creds@<agent>.service (Type=oneshot) running as
+# <agent>-mcp. systemd's LoadCredentialEncrypted= has already decrypted
+# each cred into $CREDENTIALS_DIRECTORY (a per-unit tmpfs, readable only
+# by this user). RuntimeDirectory= has set up /run/agents/<agent>-mcp/,
+# also owned by <agent>-mcp, mode 0700.
+#
+# We mirror $CREDENTIALS_DIRECTORY → /run/agents/<agent>-mcp/credentials/
+# at mode 0400 so:
+#   * the launcher (also runs as <agent>-mcp) can read them later;
+#   * the agent user (<agent>) cannot — different uid, parent dir 0700.
+#
+# RuntimeDirectoryPreserve=restart on the unit means this dir survives
+# the service exiting. Without that, every restart of the service would
+# wipe the runtime dir before the next launcher invocation.
+
+set -euo pipefail
+
+LOG_TAG="agent-mcp-creds-install"
+log() { echo "[$LOG_TAG] $*" >&2; }
+die() { echo "$LOG_TAG: $*" >&2; exit 1; }
+
+[[ -n "${CREDENTIALS_DIRECTORY:-}" ]] || die "CREDENTIALS_DIRECTORY unset — is this running under systemd?"
+[[ -n "${RUNTIME_DIRECTORY:-}"     ]] || die "RUNTIME_DIRECTORY unset — RuntimeDirectory= missing on the unit?"
+
+me="$(id -un)"
+[[ "$me" == *-mcp ]] || die "must run as a *-mcp user, got '$me'"
+
+dst="$RUNTIME_DIRECTORY/credentials"
+install -d -m 0700 -o "$me" -g "$me" "$dst"
+
+shopt -s nullglob
+count=0
+for src in "$CREDENTIALS_DIRECTORY"/*; do
+    [[ -f "$src" ]] || continue
+    name="$(basename "$src")"
+    install -m 0400 -o "$me" -g "$me" "$src" "$dst/$name"
+    count=$((count + 1))
+done
+shopt -u nullglob
+
+log "$me: installed $count credential(s) → $dst"

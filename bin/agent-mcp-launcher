@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# agent-mcp-launcher — paired-user MCP shim (Option A — credential isolation)
+#
+# Invoked as the trusted "-mcp" peer of an agent user, via:
+#   sudo -u <agent>-mcp -n /opt/agents/bin/agent-mcp-launcher <server>
+#
+# The agent user (<agent>) holds the LLM and runs Claude. The "-mcp" peer
+# (<agent>-mcp) holds the decrypted credentials at /run/agents/<agent>-mcp/
+# credentials/. /etc/sudoers.d/agent-<agent> is what lets <agent> invoke
+# THIS script — and only this script — as <agent>-mcp.
+#
+# Threat model: a fully-prompt-injected Claude must not be able to read
+# any credential file. The launcher is the choke point, so:
+#   * Reject if the effective user isn't <agent>-mcp (defence in depth —
+#     sudoers should already enforce this).
+#   * Reject any <server> that isn't in the agent's enabled tool list.
+#     Without this, the LLM could pass /etc/passwd or another absolute
+#     path and exec something arbitrary.
+#   * Hand the decrypted creds to the server purely via env vars and
+#     $CREDENTIALS_DIRECTORY — the credential files themselves never
+#     leave the trusted /run/agents/<agent>-mcp/credentials/ tree.
+
+set -euo pipefail
+
+LOG_TAG="agent-mcp-launcher"
+log()   { echo "[$LOG_TAG] $*" >&2; }
+die()   { echo "$LOG_TAG: $*" >&2; exit 1; }
+
+# ─── identity ─────────────────────────────────────────────────────────────
+
+# Effective user must be "<agent>-mcp". Derive <agent> by stripping the
+# suffix. If the suffix isn't present the launcher is being run by the
+# wrong identity — bail loudly.
+me="$(id -un)"
+[[ "$me" == *-mcp ]] || die "must run as a *-mcp user, got '$me' (sudoers misconfigured?)"
+agent="${me%-mcp}"
+[[ "$agent" =~ ^[a-z][a-z0-9_-]{1,30}$ ]] || die "derived agent name '$agent' is invalid"
+
+# ─── server arg ───────────────────────────────────────────────────────────
+
+server="${1:-}"
+[[ -n "$server" ]] || die "usage: agent-mcp-launcher <server>"
+# Strict pattern — rejects path traversal, absolute paths, etc. Even if
+# sudoers somehow allowed an arbitrary first arg, the validation here
+# prevents exec'ing /etc/passwd, /bin/bash via path tricks, etc.
+[[ "$server" =~ ^[a-z][a-z0-9_-]*$ ]] || die "invalid server name '$server'"
+
+# ─── allowlist gate (agent.toml.enabled) ─────────────────────────────────
+
+agent_toml="/home/$agent/agent.toml"
+[[ -r "$agent_toml" ]] || die "cannot read $agent_toml"
+
+# Pull the `enabled = [...]` line out of the [tools] section. agent.toml
+# is small and stable so a one-liner awk beats pulling in a full TOML
+# parser as a runtime dep here. Only the first match wins.
+enabled_line="$(awk '
+    /^\[tools\]/         { in_tools = 1; next }
+    /^\[/                { in_tools = 0 }
+    in_tools && /^enabled[[:space:]]*=/ { print; exit }
+' "$agent_toml")"
+
+[[ -n "$enabled_line" ]] || die "agent.toml has no [tools].enabled — agent misconfigured"
+
+# Match against the comma-separated list of "quoted" names in the array
+# literal. A leading/trailing punctuation guard around each name keeps
+# 'foo' from matching 'foobar'.
+case ",$(echo "$enabled_line" | tr -d ' \t\"[]')," in
+    *,"$server",*) ;;
+    *) die "server '$server' not in agent.toml [tools].enabled — refusing to launch" ;;
+esac
+
+# ─── credential staging ──────────────────────────────────────────────────
+
+cred_dir="/run/agents/$me/credentials"
+[[ -d "$cred_dir" ]] || die "credential dir $cred_dir missing — is agent-mcp-creds@$agent.service running?"
+
+# Export each cred file as an env var. Default mapping: filename →
+# UPPERCASE filename. tool.json may override per-key via "env" attr
+# (read below); when present, that wins. Either way the cred contents
+# leave the filesystem only into this process's environment, which we
+# then pass to the exec'd MCP server.
+export CREDENTIALS_DIRECTORY="$cred_dir"
+
+tool_json="/opt/agents/tools/$server/tool.json"
+declare -A env_override=()
+if [[ -r "$tool_json" ]]; then
+    # Populate env_override[<key>]=<env-var-name> for any cred entry
+    # with an explicit "env" attribute. jq is part of the bootstrap
+    # baseline so it's available here.
+    while IFS=$'\t' read -r key envname; do
+        [[ -n "$key" && -n "$envname" && "$envname" != "null" ]] || continue
+        env_override["$key"]="$envname"
+    done < <(jq -r '.credentials[]? | [.key, (.env // "null")] | @tsv' "$tool_json" 2>/dev/null || true)
+fi
+
+shopt -s nullglob
+for f in "$cred_dir"/*; do
+    [[ -f "$f" ]] || continue
+    key="$(basename "$f")"
+    # Validate the cred name shape — defence in depth against an attacker
+    # who somehow planted a file with shell-meta chars in $cred_dir. (They
+    # can't: the dir is 0700 and owned by <agent>-mcp, but be paranoid.)
+    [[ "$key" =~ ^[A-Za-z0-9_-]+$ ]] || { log "skipping odd cred name: $key"; continue; }
+
+    envname="${env_override[$key]:-${key^^}}"
+    envname="${envname//-/_}"
+    # `printf -v` is the safe way to set a dynamic var name from data.
+    value="$(cat "$f")"
+    printf -v "$envname" '%s' "$value"
+    export "$envname"
+done
+shopt -u nullglob
+
+# ─── exec the server ─────────────────────────────────────────────────────
+
+# Per-MCP-user HOME so any token cache the server writes (m365 stores a
+# refresh token under $HOME/.m365_token_cache.json) lands on the trusted
+# side rather than in the agent's Claude-readable home directory.
+mcp_home="/var/lib/agents/$me"
+if [[ ! -d "$mcp_home" ]]; then
+    # If the migration hasn't created this yet, fall back to /tmp so the
+    # launcher stays usable. This is a soft warning — agent-control create
+    # is what should be ensuring this exists.
+    log "WARN: $mcp_home missing; using /tmp as HOME (token caches will not persist)"
+    mcp_home="/tmp"
+fi
+export HOME="$mcp_home"
+export AGENT_NAME="$agent"
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+tool_dir="/opt/agents/tools/$server"
+[[ -d "$tool_dir" ]] || die "tool '$server' is enabled but $tool_dir is missing — bootstrap incomplete"
+
+if [[ -x "$tool_dir/.venv/bin/python" && -f "$tool_dir/server.py" ]]; then
+    exec "$tool_dir/.venv/bin/python" "$tool_dir/server.py"
+elif [[ -f "$tool_dir/server.ts" ]]; then
+    exec /usr/local/bin/bun run "$tool_dir/server.ts"
+else
+    die "tool '$server' has no runnable entrypoint (missing .venv/bin/python+server.py or server.ts)"
+fi

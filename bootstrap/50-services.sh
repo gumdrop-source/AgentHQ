@@ -19,6 +19,23 @@ log "Installing agent-prelaunch → /opt/agents/bin"
 install -m 0755 -o root -g agents \
     "$(agenthq_root)/bin/agent-prelaunch" /opt/agents/bin/agent-prelaunch
 
+# agent-mcp-launcher and agent-mcp-creds-install are the trusted-side
+# binaries for Option A (paired-user credential isolation). The launcher
+# is the only thing /etc/sudoers.d/agent-<name> permits the agent user
+# to run as its -mcp peer, so its path must be stable + canonical.
+log "Installing agent-mcp-launcher → /opt/agents/bin"
+install -m 0755 -o root -g agents \
+    "$(agenthq_root)/bin/agent-mcp-launcher" /opt/agents/bin/agent-mcp-launcher
+
+log "Installing agent-mcp-creds-install → /opt/agents/bin"
+install -m 0755 -o root -g agents \
+    "$(agenthq_root)/bin/agent-mcp-creds-install" /opt/agents/bin/agent-mcp-creds-install
+
+# Per-MCP-user HOMEs live under /var/lib/agents/<name>-mcp; the parent
+# dir is created here so install -d in agent-control / migrate doesn't
+# race on first use.
+install -d -o root -g agents -m 0755 /var/lib/agents
+
 log "Installing agent-control → /usr/local/bin"
 install -m 0755 \
     "$(agenthq_root)/agent-control/agent-control" /usr/local/bin/agent-control
