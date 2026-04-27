@@ -64,7 +64,7 @@ enabled_line="$(awk '
 # Match against the comma-separated list of "quoted" names in the array
 # literal. A leading/trailing punctuation guard around each name keeps
 # 'foo' from matching 'foobar'.
-case ",$(echo "$enabled_line" | tr -d ' \t\"[]')," in
+case ",$(echo "$enabled_line" | sed 's/^[^=]*=//' | tr -d ' \t\"[]')," in
     *,"$server",*) ;;
     *) die "server '$server' not in agent.toml [tools].enabled — refusing to launch" ;;
 esac
