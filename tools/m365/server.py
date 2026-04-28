@@ -10,6 +10,7 @@ of them to an agent happens in the per-agent Permissions matrix.
 
 from __future__ import annotations
 
+import base64
 import functools
 import json
 import os
@@ -257,6 +258,40 @@ def _graph_post(path: str, body: dict) -> dict:
     return r.json() if r.content else {}
 
 
+def _graph_patch(path: str, body: dict) -> dict:
+    r = requests.patch(
+        f"{GRAPH_BASE}{path}",
+        headers={
+            "Authorization": f"Bearer {_token()}",
+            "Content-Type": "application/json",
+        },
+        json=body,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json() if r.content else {}
+
+
+def _graph_delete(path: str) -> None:
+    r = requests.delete(
+        f"{GRAPH_BASE}{path}",
+        headers={"Authorization": f"Bearer {_token()}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+
+
+def _graph_get_bytes(path: str) -> tuple[bytes, str]:
+    """GET a binary endpoint (e.g. file content). Returns (bytes, content_type)."""
+    r = requests.get(
+        f"{GRAPH_BASE}{path}",
+        headers={"Authorization": f"Bearer {_token()}"},
+        timeout=60,
+    )
+    r.raise_for_status()
+    return r.content, r.headers.get("Content-Type", "application/octet-stream")
+
+
 # ─── MCP server ─────────────────────────────────────────────────────────────
 
 mcp = FastMCP(
@@ -373,54 +408,243 @@ def outlook_email_send(message_id: str | None = None, to: list[str] | None = Non
     return _graph_post("/me/sendMail", payload)
 
 
-# ─── stubs for the rest ─────────────────────────────────────────────────────
-# These are real MCP tool registrations — claude can call them — but they
-# return a 'not implemented' message so they're discoverable in the
-# Permissions matrix without yet being functional. Filled in next.
-
 @mcp.tool()
-def outlook_email_delete(message_id: str) -> str:
-    """Permanently delete an email. DESTRUCTIVE."""
-    return "outlook_email_delete: TODO — implementation pending"
+@requires_auth
+def outlook_email_delete(message_id: str) -> dict:
+    """Permanently delete an email.
 
-
-@mcp.tool()
-def calendar_search(start_iso: str, end_iso: str, calendar: str = "primary") -> str:
-    """List events between two ISO timestamps."""
-    return "calendar_search: TODO — implementation pending"
+    DESTRUCTIVE — the message is moved to Deleted Items and then removed; it
+    cannot be recovered through this tool. Confirm with the user before calling.
+    Prefer outlook_email_archive for non-destructive cleanup.
+    """
+    _graph_delete(f"/me/messages/{message_id}")
+    return {"deleted": True, "id": message_id}
 
 
 @mcp.tool()
-def calendar_create_event(subject: str, start_iso: str, end_iso: str,
-                           attendees: list[str] | None = None,
-                           body: str | None = None,
-                           location: str | None = None) -> str:
-    """Create a calendar event."""
-    return "calendar_create_event: TODO — implementation pending"
+@requires_auth
+def calendar_search(start_iso: str, end_iso: str, limit: int = 50) -> list[dict]:
+    """List calendar events whose time range overlaps [start_iso, end_iso].
+
+    Args:
+        start_iso: Window start as ISO 8601 (e.g. '2026-04-28T00:00:00Z').
+        end_iso: Window end as ISO 8601.
+        limit: Max events to return (1–100, default 50).
+
+    Uses Graph's calendarView, which expands recurring events into instances.
+    """
+    params: dict[str, Any] = {
+        "startDateTime": start_iso,
+        "endDateTime": end_iso,
+        "$top": min(max(limit, 1), 100),
+        "$orderby": "start/dateTime",
+    }
+    data = _graph_get("/me/calendarView", params=params)
+    return [
+        {
+            "id": e["id"],
+            "subject": e.get("subject"),
+            "start": (e.get("start") or {}).get("dateTime"),
+            "end": (e.get("end") or {}).get("dateTime"),
+            "timezone": (e.get("start") or {}).get("timeZone"),
+            "location": (e.get("location") or {}).get("displayName"),
+            "organizer": ((e.get("organizer") or {}).get("emailAddress") or {}).get("address"),
+            "attendees": [
+                ((a.get("emailAddress") or {}).get("address"))
+                for a in e.get("attendees", [])
+            ],
+            "is_online_meeting": e.get("isOnlineMeeting"),
+            "web_link": e.get("webLink"),
+        }
+        for e in data.get("value", [])
+    ]
 
 
 @mcp.tool()
-def calendar_update_event(event_id: str, **kwargs) -> str:
-    """Update an existing calendar event."""
-    return "calendar_update_event: TODO — implementation pending"
+@requires_auth
+def calendar_create_event(
+    subject: str,
+    start_iso: str,
+    end_iso: str,
+    timezone: str = "UTC",
+    attendees: list[str] | None = None,
+    body: str | None = None,
+    location: str | None = None,
+) -> dict:
+    """Create a calendar event on the user's primary calendar.
+
+    Args:
+        subject: Event title.
+        start_iso: Start time as ISO 8601 (interpreted in `timezone`).
+        end_iso: End time as ISO 8601 (interpreted in `timezone`).
+        timezone: IANA tz name like 'America/Los_Angeles', or 'UTC'.
+        attendees: Email addresses to invite.
+        body: Event description (plain text).
+        location: Display name for the location.
+    """
+    payload: dict[str, Any] = {
+        "subject": subject,
+        "start": {"dateTime": start_iso, "timeZone": timezone},
+        "end": {"dateTime": end_iso, "timeZone": timezone},
+    }
+    if body is not None:
+        payload["body"] = {"contentType": "Text", "content": body}
+    if location is not None:
+        payload["location"] = {"displayName": location}
+    if attendees:
+        payload["attendees"] = [
+            {"emailAddress": {"address": a}, "type": "required"} for a in attendees
+        ]
+    e = _graph_post("/me/events", payload)
+    return {
+        "id": e["id"],
+        "subject": e.get("subject"),
+        "web_link": e.get("webLink"),
+        "start": (e.get("start") or {}).get("dateTime"),
+        "end": (e.get("end") or {}).get("dateTime"),
+    }
 
 
 @mcp.tool()
-def calendar_delete_event(event_id: str) -> str:
-    """Cancel and delete a calendar event. DESTRUCTIVE."""
-    return "calendar_delete_event: TODO — implementation pending"
+@requires_auth
+def calendar_update_event(
+    event_id: str,
+    subject: str | None = None,
+    start_iso: str | None = None,
+    end_iso: str | None = None,
+    timezone: str | None = None,
+    attendees: list[str] | None = None,
+    body: str | None = None,
+    location: str | None = None,
+) -> dict:
+    """Modify an existing calendar event. Only fields you pass are changed.
+
+    To change start or end times, pass start_iso/end_iso (and timezone if it
+    differs from the original). Passing `attendees` REPLACES the attendee list.
+    """
+    payload: dict[str, Any] = {}
+    if subject is not None:
+        payload["subject"] = subject
+    # Graph requires the full {dateTime, timeZone} object to change either field.
+    # Default to UTC if a timestamp is given without a timezone.
+    if start_iso is not None:
+        payload["start"] = {"dateTime": start_iso, "timeZone": timezone or "UTC"}
+    if end_iso is not None:
+        payload["end"] = {"dateTime": end_iso, "timeZone": timezone or "UTC"}
+    if body is not None:
+        payload["body"] = {"contentType": "Text", "content": body}
+    if location is not None:
+        payload["location"] = {"displayName": location}
+    if attendees is not None:
+        payload["attendees"] = [
+            {"emailAddress": {"address": a}, "type": "required"} for a in attendees
+        ]
+    if not payload:
+        raise ValueError("calendar_update_event: pass at least one field to change.")
+    e = _graph_patch(f"/me/events/{event_id}", payload)
+    return {
+        "id": e["id"],
+        "subject": e.get("subject"),
+        "web_link": e.get("webLink"),
+        "start": (e.get("start") or {}).get("dateTime"),
+        "end": (e.get("end") or {}).get("dateTime"),
+    }
 
 
 @mcp.tool()
-def onedrive_search(query: str, limit: int = 20) -> str:
-    """Search OneDrive files by name or content."""
-    return "onedrive_search: TODO — implementation pending"
+@requires_auth
+def calendar_delete_event(event_id: str) -> dict:
+    """Cancel and delete a calendar event.
+
+    DESTRUCTIVE — the event is removed from the user's calendar and a
+    cancellation is sent to attendees. Confirm with the user before calling.
+    """
+    _graph_delete(f"/me/events/{event_id}")
+    return {"deleted": True, "id": event_id}
 
 
 @mcp.tool()
-def onedrive_read(file_id: str) -> str:
-    """Download and read a OneDrive file's contents."""
-    return "onedrive_read: TODO — implementation pending"
+@requires_auth
+def onedrive_search(query: str, limit: int = 20) -> list[dict]:
+    """Search OneDrive files by name or content.
+
+    Args:
+        query: Search terms — matches file names and indexed content.
+        limit: Max items to return (1–50, default 20).
+    """
+    # Graph's search(q='...') endpoint URL-encodes via requests' params.
+    # The single quotes around the query are part of the OData function call.
+    safe = query.replace("'", "''")
+    params = {"$top": min(max(limit, 1), 50)}
+    data = _graph_get(f"/me/drive/root/search(q='{safe}')", params=params)
+    return [
+        {
+            "id": item["id"],
+            "name": item.get("name"),
+            "size": item.get("size"),
+            "is_folder": "folder" in item,
+            "mime_type": (item.get("file") or {}).get("mimeType"),
+            "modified": item.get("lastModifiedDateTime"),
+            "web_url": item.get("webUrl"),
+            "path": (item.get("parentReference") or {}).get("path"),
+        }
+        for item in data.get("value", [])
+    ]
+
+
+# 256 KB cap on inline file content. Larger files return metadata only with a
+# note pointing the agent at the web_url — dumping multi-MB blobs into the
+# LLM context is both expensive and rarely useful.
+ONEDRIVE_READ_MAX_BYTES = 256 * 1024
+
+
+@mcp.tool()
+@requires_auth
+def onedrive_read(file_id: str) -> dict:
+    """Download and read a OneDrive file's contents.
+
+    Returns text inline for text-shaped files (utf-8 decodable, ≤256 KB).
+    For binary or oversize files, returns metadata + base64 (binary, ≤256 KB)
+    or a size-only response telling the agent to fetch via web_url.
+    """
+    meta = _graph_get(f"/me/drive/items/{file_id}")
+    if "folder" in meta:
+        raise ValueError(f"onedrive_read: '{meta.get('name')}' is a folder, not a file.")
+
+    size = meta.get("size") or 0
+    name = meta.get("name")
+    mime = (meta.get("file") or {}).get("mimeType") or "application/octet-stream"
+    web_url = meta.get("webUrl")
+
+    base = {
+        "id": meta["id"],
+        "name": name,
+        "size": size,
+        "mime_type": mime,
+        "web_url": web_url,
+    }
+
+    if size > ONEDRIVE_READ_MAX_BYTES:
+        return {
+            **base,
+            "content": None,
+            "truncated": True,
+            "message": (
+                f"File is {size} bytes, larger than the {ONEDRIVE_READ_MAX_BYTES}-byte "
+                "inline limit. Open it via web_url instead."
+            ),
+        }
+
+    content, _ctype = _graph_get_bytes(f"/me/drive/items/{file_id}/content")
+    try:
+        text = content.decode("utf-8")
+        return {**base, "encoding": "utf-8", "content": text}
+    except UnicodeDecodeError:
+        return {
+            **base,
+            "encoding": "base64",
+            "content": base64.b64encode(content).decode("ascii"),
+        }
 
 
 # ─── entry ──────────────────────────────────────────────────────────────────
