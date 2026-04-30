@@ -1194,7 +1194,7 @@ app.get("/integrations/:id/configure", (c) => {
     const m = loadManifest(id);
     if (!m) return c.html(errorPage("No such integration"));
 
-    const credList = (m.credentials ?? []).map((cred: any) => {
+    const credList = (m.credentials ?? []).filter((cred: any) => !cred.hidden).map((cred: any) => {
         const stored = existsSync(`/etc/agents/credentials/${cred.key}.cred`);
         return `<li class="flex items-center justify-between py-1.5 border-b border-slate-100 last:border-0">
           <span class="font-mono text-sm">${escapeHtml(cred.key)}</span>
@@ -1204,15 +1204,192 @@ app.get("/integrations/:id/configure", (c) => {
         </li>`;
     }).join("");
 
-    return c.html(layout(`Configure ${m.title ?? id}`, card(`
-        ${pageHeader(`Configure ${escapeHtml(m.title ?? id)}`)}
-        <p class="text-sm text-slate-700 mb-3">Stored credentials (values not shown — they're encrypted in the vault):</p>
-        <ul class="mb-6">${credList}</ul>
-        <div class="flex gap-3">
-          <a href="/integrations/${id}/activate" class="inline-block px-4 py-2 rounded-lg font-medium bg-slate-100 text-slate-900 hover:bg-slate-200">Re-enter credentials</a>
-          ${button("Back", { href: `/integrations/${id}`, intent: "secondary" })}
+    return c.html(layout(`Configure ${m.title ?? id}`, `
+        ${card(`
+          ${pageHeader(`Configure ${escapeHtml(m.title ?? id)}`)}
+          <p class="text-sm text-slate-700 mb-3">Stored credentials (values not shown — they're encrypted in the vault):</p>
+          <ul class="mb-6">${credList}</ul>
+          <div class="flex gap-3">
+            <a href="/integrations/${id}/activate" class="inline-block px-4 py-2 rounded-lg font-medium bg-slate-100 text-slate-900 hover:bg-slate-200">Re-enter credentials</a>
+            ${button("Back", { href: `/integrations/${id}`, intent: "secondary" })}
+          </div>
+        `)}
+
+        <div class="mt-6 bg-white rounded-xl shadow-sm border border-rose-200 p-6">
+          <h3 class="font-medium text-rose-700 mb-1">Danger zone</h3>
+          <p class="text-sm text-slate-700 mb-4">Deactivating wipes the platform credentials and every per-user authorization. Agents that have this integration granted will keep the grant, but every user will need to re-authorize through Telegram on first use after re-activation.</p>
+          <a href="/integrations/${id}/deactivate" class="inline-block px-4 py-2 rounded-lg font-medium bg-rose-600 text-white hover:bg-rose-500">Deactivate integration</a>
         </div>
+    `, "integrations", c.get("user")));
+});
+
+// ─── Integration deactivation ──────────────────────────────────────────────
+//
+// Deactivation = wipe the vault credentials for this integration + every
+// per-agent persistent state file that belongs to it (per-user OAuth tokens,
+// pending auth states, legacy single-cache files), then regenerate each
+// affected agent's systemd cred drop-in so the missing creds don't block
+// the unit on next start. The integration card flips back to "Activate".
+//
+// We intentionally DON'T untick this tool's permissions in any agent's
+// agent.toml — re-activating later means agents that had the tool granted
+// still have it, with no manual re-permission step. The cost is that
+// between deactivate and re-activate, granted-but-uncredentialed tool
+// calls error with "MYOB platform credentials missing" — visible but not
+// catastrophic.
+
+// Per-tool helper. Returns the names of files/dirs under
+// /var/lib/agents/<agent>-mcp/ that belong to this tool. We use prefix
+// matching so the helper handles both "myob_*" siblings (myob_tokens,
+// myob_pending_auth, myob_refresh_token) and m365's leading-dot
+// pattern (.m365_token_cache.json) without per-tool wiring.
+function toolStateGlobs(toolId: string, mcpHome: string): string[] {
+    const candidates: string[] = [];
+    let entries: string[] = [];
+    try {
+        entries = readdirSync(mcpHome);
+    } catch {
+        return [];
+    }
+    for (const name of entries) {
+        if (name === toolId
+            || name.startsWith(`${toolId}_`)
+            || name.startsWith(`${toolId}.`)
+            || name.startsWith(`.${toolId}_`)
+            || name.startsWith(`.${toolId}.`)) {
+            candidates.push(`${mcpHome}/${name}`);
+        }
+    }
+    return candidates;
+}
+
+// Walk /home/* looking for agents whose agent.toml [tools].enabled
+// includes this tool. The launcher's allowlist gate is what makes
+// agent.toml authoritative, not settings.json.
+function agentsWithToolEnabled(toolId: string): string[] {
+    const agents: string[] = [];
+    let entries: string[] = [];
+    try {
+        entries = readdirSync("/home");
+    } catch {
+        return [];
+    }
+    for (const name of entries) {
+        const tomlPath = `/home/${name}/agent.toml`;
+        if (!existsSync(tomlPath)) continue;
+        let toml: string;
+        try {
+            toml = readFileSync(tomlPath, "utf8");
+        } catch {
+            continue;
+        }
+        // Crude but sufficient: the [tools].enabled line is rendered as
+        // `enabled = ["t1", "t2", ...]` — match the bare quoted name.
+        const m = toml.match(/^\s*enabled\s*=\s*\[([^\]]*)\]/m);
+        if (!m) continue;
+        const list = m[1].split(",").map((s) => s.trim().replace(/^"|"$/g, ""));
+        if (list.includes(toolId)) agents.push(name);
+    }
+    return agents;
+}
+
+app.get("/integrations/:id/deactivate", (c) => {
+    const id = c.req.param("id");
+    const m = loadManifest(id);
+    if (!m) return c.html(errorPage("No such integration"));
+
+    const credKeys = (m.credentials ?? []).map((cred: any) => cred.key as string);
+    const credsPresent = credKeys.filter((k) => existsSync(`/etc/agents/credentials/${k}.cred`));
+    const agents = agentsWithToolEnabled(id);
+
+    // Count what will be wiped per-agent so the operator sees the blast radius.
+    const perAgent = agents.map((name) => {
+        const home = `/var/lib/agents/${name}-mcp`;
+        const stateFiles = toolStateGlobs(id, home);
+        return { name, stateFiles };
+    });
+
+    const agentsHtml = perAgent.length === 0
+        ? `<p class="text-sm text-slate-500 italic">No agents currently have this integration granted.</p>`
+        : `<ul class="space-y-1">${perAgent.map((a) => `
+            <li class="text-sm">
+              <span class="font-mono">${escapeHtml(a.name)}</span>
+              <span class="text-xs text-slate-500 ml-2">${a.stateFiles.length} state file${a.stateFiles.length === 1 ? "" : "s"} to wipe</span>
+            </li>
+          `).join("")}</ul>`;
+
+    const credsHtml = credsPresent.length === 0
+        ? `<p class="text-sm text-slate-500 italic">No vault credentials currently stored.</p>`
+        : `<ul class="space-y-1">${credsPresent.map((k) => `
+            <li class="font-mono text-sm">${escapeHtml(k)}</li>
+          `).join("")}</ul>`;
+
+    return c.html(layout(`Deactivate ${m.title ?? id}`, card(`
+        ${pageHeader(`Deactivate ${escapeHtml(m.title ?? id)}`, "Review what will be removed before confirming.")}
+
+        <h4 class="font-medium text-slate-900 mt-4 mb-2">Vault credentials to wipe</h4>
+        ${credsHtml}
+
+        <h4 class="font-medium text-slate-900 mt-6 mb-2">Per-agent state to wipe</h4>
+        ${agentsHtml}
+
+        <p class="text-sm text-slate-700 mt-6">After deactivation:</p>
+        <ul class="text-sm text-slate-700 list-disc list-inside space-y-1 mt-1">
+          <li>The integration card flips back to <strong>Activate</strong>.</li>
+          <li>Each affected agent's systemd cred drop-in is regenerated and the agent is restarted.</li>
+          <li>Per-agent permissions are <strong>preserved</strong> — re-activating restores the integration without further setup, but every Telegram user will need to re-authorize on their first call.</li>
+        </ul>
+
+        <form method="POST" action="/integrations/${id}/deactivate" class="mt-6 flex gap-3">
+          <button type="submit" class="inline-block px-4 py-2 rounded-lg font-medium bg-rose-600 text-white hover:bg-rose-500">Yes, deactivate</button>
+          ${button("Cancel", { href: `/integrations/${id}/configure`, intent: "secondary" })}
+        </form>
     `), "integrations", c.get("user")));
+});
+
+app.post("/integrations/:id/deactivate", async (c) => {
+    const id = c.req.param("id");
+    const m = loadManifest(id);
+    if (!m) return c.html(errorPage("No such integration"));
+
+    const fs = await import("node:fs");
+    const errors: string[] = [];
+
+    // 1. Wipe vault entries for every cred this integration declared.
+    for (const cred of (m.credentials ?? [])) {
+        const path = `/etc/agents/credentials/${cred.key}.cred`;
+        if (!existsSync(path)) continue;
+        try {
+            fs.rmSync(path, { force: true });
+        } catch (e) {
+            errors.push(`vault: ${cred.key}: ${String(e)}`);
+        }
+    }
+
+    // 2. Wipe per-agent state for every agent that had this tool granted,
+    //    and regenerate their systemd cred drop-in so the missing vault
+    //    files don't block the unit on next start.
+    const affectedAgents = agentsWithToolEnabled(id);
+    for (const name of affectedAgents) {
+        const home = `/var/lib/agents/${name}-mcp`;
+        for (const path of toolStateGlobs(id, home)) {
+            try {
+                fs.rmSync(path, { recursive: true, force: true });
+            } catch (e) {
+                errors.push(`state ${name}: ${String(e)}`);
+            }
+        }
+        try {
+            await writeSystemdDropIn(name);
+        } catch (e) {
+            errors.push(`drop-in ${name}: ${String(e)}`);
+        }
+    }
+
+    if (errors.length > 0) {
+        return c.html(errorPage(`Deactivation finished with errors`, errors.join("; ")));
+    }
+    return c.redirect("/integrations");
 });
 
 app.get("/updates", (c) => c.html(layout("Updates", card(`
