@@ -723,7 +723,28 @@ function discoveryTargetField(oauth: OAuthManifest, m: any): string | undefined 
     return undefined;
 }
 
-function renderOAuthHelper(id: string, oauth: OAuthManifest): string {
+function renderOAuthHelper(id: string, oauth: OAuthManifest, m: any): string {
+    // Detect "discovery-only" mode: the manifest declares an OAuth flow but
+    // the refresh_token field is hidden, meaning the wizard isn't trying to
+    // save an admin token — it's only running the dance to auto-fill the
+    // discovery target (e.g. company file GUID). Reframe the UI so the
+    // operator doesn't see a "Sign in" button that suggests they're
+    // authenticating the integration itself (in per-user mode they're not —
+    // each end user signs in via their own auth dance later).
+    const refreshCred = (m.credentials ?? []).find(
+        (c: any) => c.key === oauth.refresh_token_field,
+    );
+    const discoveryOnly = !!refreshCred && !!refreshCred.hidden && !!oauth.discovery;
+    const discoveryNoun = oauth.discovery === "myob_company_files" ? "company file" : "account";
+    const helperTitle = discoveryOnly
+        ? `Auto-fill your ${discoveryNoun}`
+        : "Authorize this integration";
+    const helperSubtitle = discoveryOnly
+        ? `Fill <strong>API Key</strong> and <strong>API Secret</strong> above, then sign in once so the wizard can fetch your ${discoveryNoun} ID without you typing it. Each end user will sign in separately for their own access.`
+        : "Fill in <strong>API Key</strong> and <strong>API Secret</strong> above, then come back here.";
+    const ctaLabel = discoveryOnly
+        ? `Find my ${discoveryNoun} →`
+        : "Sign in with provider →";
     return `
       <div class="rounded-xl border border-blue-200 bg-blue-50 p-4 space-y-3"
            data-oauth-helper
@@ -734,17 +755,18 @@ function renderOAuthHelper(id: string, oauth: OAuthManifest): string {
            data-authorize-url="${escapeHtml(oauth.authorize_url)}"
            data-redirect-uri="${escapeHtml(oauth.redirect_uri)}"
            data-scope="${escapeHtml(oauth.scope)}"
-           data-discovery="${escapeHtml(oauth.discovery ?? "")}">
+           data-discovery="${escapeHtml(oauth.discovery ?? "")}"
+           data-discovery-only="${discoveryOnly ? "true" : "false"}">
         <div>
-          <h4 class="font-medium text-slate-900">Authorize this integration</h4>
-          <p class="text-xs text-slate-600 mt-1" data-oauth-stage-help>Fill in <strong>API Key</strong> and <strong>API Secret</strong> above, then come back here.</p>
+          <h4 class="font-medium text-slate-900">${escapeHtml(helperTitle)}</h4>
+          <p class="text-xs text-slate-600 mt-1" data-oauth-stage-help>${helperSubtitle}</p>
         </div>
 
         <!-- Stage 1 — kick off the OAuth dance ─────────────────────────── -->
         <div data-oauth-stage="1">
           <a href="#" data-oauth-authorize
              class="pointer-events-none opacity-50 block w-full text-center px-4 py-3 rounded-lg font-medium text-sm bg-slate-900 text-white hover:bg-slate-700"
-             target="_blank" rel="noopener noreferrer">Sign in with provider →</a>
+             target="_blank" rel="noopener noreferrer">${escapeHtml(ctaLabel)}</a>
           <p class="text-xs text-slate-500 mt-2" data-oauth-authorize-hint>(enter API Key first to enable)</p>
         </div>
 
@@ -884,13 +906,15 @@ function renderOAuthHelper(id: string, oauth: OAuthManifest): string {
             }
             if (refreshInput) refreshInput.value = data.refresh_token;
 
+            const discoveryOnly = helper.dataset.discoveryOnly === 'true';
+            const okWord = discoveryOnly ? 'Found.' : 'Authorized.';
             const opts = data.discovery_options || [];
             const target = data.discovery_target_field;
             if (target && opts.length === 1) {
               // Exactly one match — silently auto-fill, no UI noise.
               setHiddenValue(target, opts[0].value);
               showStage(0);
-              stageHelp.innerHTML = '<span class="text-emerald-700 font-medium">✓ Authorized.</span> Click <strong>Activate</strong> below to save.';
+              stageHelp.innerHTML = '<span class="text-emerald-700 font-medium">✓ ' + okWord + '</span> Click <strong>Activate</strong> below to save.';
               clearStatus();
             } else if (target && opts.length > 1) {
               // Multiple matches — let the user pick.
@@ -905,7 +929,7 @@ function renderOAuthHelper(id: string, oauth: OAuthManifest): string {
               setHiddenValue(target, discoverySelect.value);
               discoverySelect.addEventListener('change', () => setHiddenValue(target, discoverySelect.value));
               showStage(3);
-              stageHelp.innerHTML = '<span class="text-emerald-700 font-medium">✓ Authorized.</span> Pick the right option, then click <strong>Activate</strong> below.';
+              stageHelp.innerHTML = '<span class="text-emerald-700 font-medium">✓ ' + okWord + '</span> Pick the right option, then click <strong>Activate</strong> below.';
               clearStatus();
             } else if (target && opts.length === 0) {
               // Discovery declared but returned nothing — surface the
@@ -915,14 +939,14 @@ function renderOAuthHelper(id: string, oauth: OAuthManifest): string {
               const input   = document.getElementById('cred-' + target);
               if (wrapper) wrapper.classList.remove('hidden');
               if (input)  { input.type = 'text'; input.required = true; }
-              stageHelp.innerHTML = '<span class="text-amber-700 font-medium">Authorized,</span> but auto-discovery returned no options — please fill the remaining field by hand and click Activate.';
+              stageHelp.innerHTML = '<span class="text-amber-700 font-medium">Auto-discovery returned no options.</span> Please fill the remaining field by hand and click Activate.';
               clearStatus();
             } else {
               // Manifest declares no discovery — only the refresh_token
               // was hidden, and it's now populated. Operator just clicks
               // Activate.
               showStage(0);
-              stageHelp.innerHTML = '<span class="text-emerald-700 font-medium">✓ Authorized.</span> Click <strong>Activate</strong> below to save.';
+              stageHelp.innerHTML = '<span class="text-emerald-700 font-medium">✓ ' + okWord + '</span> Click <strong>Activate</strong> below to save.';
               clearStatus();
             }
           } catch (e) {
@@ -976,7 +1000,7 @@ app.get("/integrations/:id/activate", (c) => {
     const toolsDir = process.env.AGENTHQ_TOOLS_DIR ?? "/opt/agents/tools";
     const setupPath = `${toolsDir}/${id}/setup.md`;
     const setupMd = existsSync(setupPath) ? readFileSync(setupPath, "utf8") : "";
-    const oauthHelper = oauth ? renderOAuthHelper(id, oauth) : "";
+    const oauthHelper = oauth ? renderOAuthHelper(id, oauth, m) : "";
 
     return c.html(layout(`Activate ${m.title ?? id}`, `
         <div class="mb-6">
