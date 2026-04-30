@@ -456,14 +456,39 @@ def gigafy_portal_create_purchase_invoice(invoice_json: str) -> dict:
     operator the full JSON preview and get explicit confirmation before
     calling.
 
-    Important: the front-end sends a FLAT header object where line items
-    live as a STRINGIFIED JSON ARRAY in `header.items`, not as a separate
-    table1 array. Specifically:
+    Schema gotchas (verified against the live API on 2026-04-30 — the
+    server returns `item1: true` even on partial-commit failures, so
+    these matter):
 
-      const rows = [/* array of line item objects */];
-      header.saleLocation = JSON.stringify(saleLocation);
-      header.items        = JSON.stringify(rows);
-      PUT /api/Purchases/Invoices    body = header
+      * `header.items`         must be a **JSON-stringified array**, not
+                               a real array. If you send a real array,
+                               the server returns success but commits
+                               nothing.
+      * `header.saleLocation`  must be a **JSON-stringified object**.
+      * Each line item must include `visibleindex` (LOWERCASE — the
+                               server reads the database column name).
+                               Set it to the line's position in the
+                               array (0 for the first line, 1 for the
+                               second, etc.). Without it, the server
+                               returns the same fake-success but fails
+                               with a NOT-NULL constraint internally.
+      * Each line item's `taxes` field is itself a
+                               **JSON-stringified array** of tax rows
+                               (one row per applicable tax). Each row:
+                               { "purchaseInvoiceItemId": 0,
+                                 "taxRateEntityId": "<guid>",
+                                 "tax": <amount> }
+                               Use `null` (the value, not a string) when
+                               the line has no tax (e.g. taxCode "N-T").
+
+    Tax rate GUIDs (Australian reseller, captured from a real Rent
+    invoice — these are reseller-specific so confirm via tax_group_list
+    if you ever see "tax rate not found"):
+
+      * 10% GST taxRateEntityId: BAEC6D5D-0868-4C15-B18E-BBF850B41AB7
+      * GST          taxGroupEntityId: c857d2f6-eea0-4ede-ae20-51f7b83d6bef
+      * N-T          taxGroupEntityId: 3b58ee46-aa71-486c-8147-9d3c51db224d
+      * GST Free     taxGroupEntityId: 13450446-5382-41b8-bdbb-bbc9e8580793
 
     Recommended pattern:
       1. supplier_lookup → resolve supplierEntityId
@@ -471,20 +496,30 @@ def gigafy_portal_create_purchase_invoice(invoice_json: str) -> dict:
       3. invoice_load(prior_id) → read its table1 line items
       4. invoice_blank() → fresh header skeleton (its entityId is
          pre-allocated; use it as parentEntityId on each new line item)
-      5. Copy the prior coding fields onto your new line items, swap
-         in the new productName / productCost / total / quantity / GST
-      6. Build the flat header object: copy from blank's table[0],
-         set supplierEntityId, invoiceNumber, invoiceDate, dueDate,
-         saleLocation (stringify it), items (stringify the line items)
+      5. Copy the prior coding fields (stockEntityId, coaEntityId,
+         taxGroupEntityId) onto your new line items; swap in the new
+         productName / productCost / total / quantity; rebuild the
+         taxes JSON-string for the new GST amount.
+      6. Build the flat header object from blank's table[0]; set
+         supplierEntityId, invoiceNumber, invoiceDate, dueDate;
+         keep saleLocation as a stringified JSON object;
+         set items = JSON-stringified array (with visibleindex on each).
       7. Show the operator a preview, ask "save?"
-      8. On explicit yes, call this tool with the JSON-encoded header
+      8. On explicit yes, call this tool.
+
+    This wrapper performs a verify-after-create read: after the PUT,
+    it loads the invoice by entityId and confirms the header's
+    invoiceNumber matches and table1 has at least the line count we
+    sent. If the round-trip fails, the wrapper raises rather than
+    pretending success — the operator gets a clear error instead of a
+    silent orphan record.
 
     Args:
-        invoice_json: JSON-encoded flat header object. `items` should be
-            a JSON-encoded STRING (a stringified array of line items),
-            not an array. `saleLocation` likewise stringified.
+        invoice_json: JSON-encoded flat header object. `items` and
+            `saleLocation` must be JSON-encoded STRINGS, not literal
+            arrays/objects.
 
-    Response shape: {item1: bool, item2: string} — Tuple<success, message>.
+    Returns: {item1: bool, item2: string, verified: bool, entity_id: str}.
     """
     try:
         body = json.loads(invoice_json)
@@ -492,7 +527,69 @@ def gigafy_portal_create_purchase_invoice(invoice_json: str) -> dict:
         raise ValueError(f"invoice_json is not valid JSON: {e}") from e
     if not isinstance(body, dict):
         raise ValueError("invoice_json must encode a JSON object")
-    return _put("/api/Purchases/Invoices", body)
+
+    # Server-side validation hints — surface common shape mistakes before
+    # they hit the API and produce confusing fake-success responses.
+    if "items" in body and not isinstance(body["items"], str):
+        raise ValueError(
+            "header.items must be a JSON-stringified array (not a real "
+            "array). The server returns success but commits nothing if "
+            "items is sent as an array."
+        )
+    if "saleLocation" in body and not isinstance(body["saleLocation"], str):
+        raise ValueError("header.saleLocation must be a JSON-stringified object.")
+    if "items" in body:
+        try:
+            items_arr = json.loads(body["items"])
+        except json.JSONDecodeError as e:
+            raise ValueError(f"header.items is not valid stringified JSON: {e}")
+        if not isinstance(items_arr, list):
+            raise ValueError("header.items, decoded, must be a JSON array.")
+        for i, it in enumerate(items_arr):
+            if "visibleindex" not in it:
+                raise ValueError(
+                    f"item {i} is missing the `visibleindex` field "
+                    "(lowercase, integer). The server's NOT-NULL "
+                    "constraint on this column silently fails the commit "
+                    "while still returning item1=true."
+                )
+
+    expected_invoice_number = body.get("invoiceNumber")
+    entity_id = body.get("entityId")
+    expected_line_count = len(json.loads(body["items"])) if body.get("items") else 0
+
+    response = _put("/api/Purchases/Invoices", body)
+
+    # Verify the create actually persisted. The Portal returns
+    # `{item1: true, item2: ""}` even on silent commit failures, so
+    # trust-but-verify by loading the entity and checking the data.
+    verified = False
+    if entity_id:
+        try:
+            loaded = _get(f"/api/Purchases/Invoices/{entity_id}")
+            h = (loaded.get("table") or [{}])[0] if isinstance(loaded, dict) else {}
+            line_count = len(loaded.get("table1") or []) if isinstance(loaded, dict) else 0
+            verified = (
+                h.get("invoiceNumber") == expected_invoice_number
+                and line_count >= expected_line_count
+            )
+        except Exception:
+            verified = False
+
+    if isinstance(response, dict) and response.get("item1") and not verified:
+        raise RuntimeError(
+            "Server reported success but the invoice did not persist correctly. "
+            f"Loaded record: invoiceNumber={(h or {}).get('invoiceNumber')}, "
+            f"table1 lines={line_count} (expected {expected_line_count}). "
+            "Check the items array — the most common cause is missing "
+            "`visibleindex` on a line item."
+        )
+
+    return {
+        **(response if isinstance(response, dict) else {"raw": response}),
+        "verified": verified,
+        "entity_id": entity_id,
+    }
 
 
 # ─── entry ─────────────────────────────────────────────────────────────────
