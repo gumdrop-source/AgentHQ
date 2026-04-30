@@ -491,21 +491,49 @@ def gigafy_portal_create_purchase_invoice(invoice_json: str) -> dict:
       * GST Free     taxGroupEntityId: 13450446-5382-41b8-bdbb-bbc9e8580793
 
     Recommended pattern:
-      1. supplier_lookup → resolve supplierEntityId
-      2. invoice_history(supplier_id) → find a similar prior invoice
-      3. invoice_load(prior_id) → read its table1 line items
-      4. invoice_blank() → fresh header skeleton (its entityId is
-         pre-allocated; use it as parentEntityId on each new line item)
-      5. Copy the prior coding fields (stockEntityId, coaEntityId,
-         taxGroupEntityId) onto your new line items; swap in the new
-         productName / productCost / total / quantity; rebuild the
-         taxes JSON-string for the new GST amount.
-      6. Build the flat header object from blank's table[0]; set
+      1. supplier_lookup → resolve supplierEntityId.
+      2. invoice_history(supplier_id) → look for a similar prior invoice.
+         IF a similar prior exists:
+            a. invoice_load(prior_id) → read its table1 line items.
+            b. Copy its stockEntityId / coaEntityId / coaCode /
+               taxGroupEntityId onto your new line items unchanged.
+               This is the "learn from prior coding" path — it's the
+               fastest and matches how the operator codes things.
+         ELSE (no history, OR the prior coding is clearly inappropriate
+               for this invoice's description):
+            a. account_lookup(query) → search the chart of accounts.
+               Build the query from keywords in the invoice
+               description / vendor type (e.g. "repair", "rent",
+               "diagnostic", "internet", "marketing"). Pick the account
+               whose name and code level look right (typically a level-3
+               leaf account like "6-1234 Repairs & Maintenance").
+            b. stock_lookup(query) → search stock items for a fitting
+               category. If nothing fits, fall back to a generic stock
+               item (the prior history's most-used one is a reasonable
+               default; otherwise check what other vendors of similar
+               type use).
+            c. tax_group_list() → pick GST (Goods & Services Tax) for
+               most Australian invoices that show GST on the source
+               document, or N-T (Non Reportable) for GST-free items.
+            d. Use the picked GUIDs as the line item's coding.
+            e. **Always surface your picks in the preview** ("I'm
+               coding this to 6-1234 Repairs & Maintenance under
+               GST — confirm?"). When the operator confirms, you may
+               also want to set rememberMe=true so future invoices
+               from this supplier auto-apply this coding.
+      3. invoice_blank() → fresh header skeleton (its entityId is
+         pre-allocated; use it as parentEntityId on each new line item).
+      4. Build the new line items: copy your chosen coding GUIDs, set
+         productName / productCost / total / quantity from the parsed
+         invoice; rebuild the taxes JSON-string for the new GST amount.
+      5. Build the flat header object from blank's table[0]; set
          supplierEntityId, invoiceNumber, invoiceDate, dueDate;
          keep saleLocation as a stringified JSON object;
          set items = JSON-stringified array (with visibleindex on each).
-      7. Show the operator a preview, ask "save?"
-      8. On explicit yes, call this tool.
+      6. Show the operator a preview that explicitly names every
+         coding decision the bot made (especially when no prior
+         existed), and ask "save?".
+      7. On explicit yes, call this tool.
 
     This wrapper performs a verify-after-create read: after the PUT,
     it loads the invoice by entityId and confirms the header's
