@@ -620,6 +620,83 @@ def gigafy_portal_create_purchase_invoice(invoice_json: str) -> dict:
     }
 
 
+# ─── ledger queries ────────────────────────────────────────────────────────
+#
+# The Ledger endpoint returns the accounting journal — one row per
+# debit/credit posting against an account in a date range. For an
+# expense account like "6-1410 Advertising" this is mostly purchase
+# invoice line items, but it can also include journal adjustments
+# and reversals, so it's the source of truth for "what was spent on
+# this account between X and Y".
+
+import datetime as _dt
+
+
+def _to_epoch_ms(value: str) -> int:
+    """Convert an ISO 'YYYY-MM-DD' (or 'YYYY-MM-DDTHH:MM:SS') string to
+    milliseconds since 1970-01-01. The Portal's ledger endpoint takes
+    epoch-milliseconds as path segments."""
+    s = (value or "").strip()
+    if not s:
+        raise ValueError("date is required (YYYY-MM-DD)")
+    # Accept either bare-date or full-ISO-with-time
+    try:
+        if "T" in s:
+            dt = _dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        else:
+            dt = _dt.datetime.fromisoformat(s)
+    except ValueError as e:
+        raise ValueError(f"date must be ISO 'YYYY-MM-DD': {value!r} ({e})") from e
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_dt.timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+@mcp.tool()
+def gigafy_portal_ledger_for_account(
+    coa_entity_id: str,
+    date_from: str,
+    date_to: str,
+) -> Any:
+    """Pull the accounting ledger for one chart-of-accounts account
+    over a date range. Use to answer questions like "list all
+    marketing expenses last quarter" or "how much have we spent on
+    Repairs & Maintenance YTD".
+
+    Returns the ledger entries — each row is a debit/credit posting
+    against this account, with the source document type / number / date.
+    For expense accounts that's typically the purchase-invoice line
+    items, but can include journal adjustments and reversals.
+
+    Row shape: {entityId, code, description, dr, cr, timestamp,
+    journal, memo, groupName, locationName}. Notably the amounts come
+    back as `dr` (debit) and `cr` (credit) — NOT `debit`/`credit`.
+    For an expense account, sum(`dr` - `cr`) gives the net spend.
+    The `journal` code is two letters: "PJ" = Purchase Journal,
+    "SJ" = Sales Journal, "GJ" = General Journal, etc.
+
+    Args:
+        coa_entity_id: GUID of the account. Get from
+            gigafy_portal_account_lookup(query).
+        date_from: ISO date 'YYYY-MM-DD' (inclusive). Tool converts
+            to epoch-ms internally.
+        date_to: ISO date 'YYYY-MM-DD' (inclusive).
+
+    For multi-account roll-ups (e.g. "marketing" spans Advertising +
+    Sponsorships + Trade Shows), call this once per coaEntityId and
+    combine — the API doesn't accept multiple accounts in one call.
+    """
+    if not coa_entity_id:
+        raise ValueError("coa_entity_id is required")
+    epoch_from = _to_epoch_ms(date_from)
+    epoch_to = _to_epoch_ms(date_to)
+    if epoch_to < epoch_from:
+        raise ValueError("date_to must be on or after date_from")
+    return _get(
+        f"/api/Resellers/{RESELLER_ID}/Ledger/{coa_entity_id}/{epoch_from}/{epoch_to}"
+    )
+
+
 # ─── entry ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

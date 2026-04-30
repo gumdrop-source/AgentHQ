@@ -65,6 +65,9 @@
     "gigafy_portal_invoice_attach": {
       "description": "Attach a file (PDF / image / doc) to an existing purchase invoice — multipart upload",
       "destructive": true
+    },
+    "gigafy_portal_ledger_for_account": {
+      "description": "Ledger entries for one chart-of-accounts account over a date range — answers 'how much have we spent on X'"
     }
   }
 }
