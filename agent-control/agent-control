@@ -103,6 +103,7 @@ mcp_creds_for_tools() {
         echo "myob_client_id"
         echo "myob_client_secret"
         echo "myob_refresh_token"
+        echo "myob_business_id"
     fi
     if [[ ",$tools," == *,hikvision,* ]]; then
         echo "hikvision_user"

@@ -1,0 +1,78 @@
+{
+  "name": "myob",
+  "title": "MYOB AccountRight",
+  "description": "Read-only access to MYOB AccountRight Live: chart of accounts, P&L reports, employee payroll details (incl. leave balances), and wage/entitlement categories.",
+  "credentials": [
+    {
+      "key": "myob_client_id",
+      "label": "API Key",
+      "env": "MYOB_CLIENT_ID",
+      "description": "Shown as 'Key' on your registered app at my.myob.com.au/Bd/RegisteredApps.aspx. (OAuth2 calls this the client_id.)"
+    },
+    {
+      "key": "myob_client_secret",
+      "label": "API Secret",
+      "env": "MYOB_CLIENT_SECRET",
+      "secret": true,
+      "description": "Shown as 'Secret' on the same registered-app page. (OAuth2 calls this the client_secret.)"
+    },
+    {
+      "key": "myob_refresh_token",
+      "label": "Refresh Token",
+      "env": "MYOB_REFRESH_TOKEN",
+      "secret": true,
+      "description": "Initial OAuth refresh token. Rotates on every refresh — the running tool persists the latest value to its own writable cache."
+    },
+    {
+      "key": "myob_business_id",
+      "label": "Company File GUID",
+      "env": "MYOB_BUSINESS_ID",
+      "description": "GUID of the AccountRight company file. The wizard auto-discovers and pre-fills this after the OAuth handshake — typically you don't need to type it."
+    }
+  ],
+  "oauth": {
+    "authorize_url": "https://secure.myob.com/oauth2/account/authorize/",
+    "token_url": "https://secure.myob.com/oauth2/v1/authorize",
+    "redirect_uri": "http://localhost",
+    "scope": "offline_access openid sme-banking sme-company-file sme-contacts-employee sme-general-ledger sme-payroll",
+    "client_id_field": "myob_client_id",
+    "client_secret_field": "myob_client_secret",
+    "refresh_token_field": "myob_refresh_token",
+    "discovery": "myob_company_files"
+  },
+  "tools": {
+    "myob_company_file_info": {
+      "description": "Sanity check + company file metadata (name, AccountRight version, last sync time)"
+    },
+    "myob_accounts": {
+      "description": "List the chart of accounts, optionally filtered by classification or account-number prefix"
+    },
+    "myob_pl_summary": {
+      "description": "Profit & Loss summary report for a single date range"
+    },
+    "myob_pl_compare": {
+      "description": "Profit & Loss summary for multiple periods, returned side-by-side"
+    },
+    "myob_employee_lookup": {
+      "description": "Find employees by first or last name; returns UIDs for drill-down"
+    },
+    "myob_employee_payroll_details": {
+      "description": "Full payroll record for one employee by UID: salary, hourly rate, super, tax, wage categories, leave entitlements"
+    },
+    "myob_employee_standard_pay": {
+      "description": "Standard (recurring) pay configuration for one employee by UID"
+    },
+    "myob_employee_leave_balance": {
+      "description": "Convenience: look up an employee by name and return only their assigned leave entitlements (hours and days)"
+    },
+    "myob_wage_categories": {
+      "description": "List of wage payroll categories (ordinary time, overtime, allowances, etc.)"
+    },
+    "myob_entitlement_categories": {
+      "description": "List of entitlement payroll categories (sick leave, holiday leave, long-service leave, etc.)"
+    },
+    "myob_raw_get": {
+      "description": "Escape hatch: GET an arbitrary AccountRight company-file path with optional query params"
+    }
+  }
+}

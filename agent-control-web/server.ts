@@ -684,24 +684,293 @@ function loadManifest(id: string): any | null {
     try { return JSON.parse(readFileSync(path, "utf8")); } catch { return null; }
 }
 
+// ─── OAuth helper (manifest-driven activation flow) ───────────────────────
+//
+// When tool.json declares an `oauth` block, the activate page renders an
+// inline helper that walks the operator through the authorization-code
+// dance. The user enters their API Key + Secret in the form, the helper
+// builds the authorize URL on the fly, the user signs in to the upstream
+// provider in a new tab, the provider redirects to http://localhost
+// (which fails in the browser by design — that 404 page just lets the
+// user copy the `?code=…` URL out of the address bar), the user pastes
+// that URL back, and the wizard exchanges it server-side for the
+// refresh_token. Optional `discovery` hooks then auto-fill follow-up
+// fields (e.g. company file GUID) so the operator almost never has to
+// type anything beyond the API Key + Secret.
+type OAuthManifest = {
+    authorize_url: string;
+    token_url: string;
+    redirect_uri: string;
+    scope: string;
+    client_id_field: string;
+    client_secret_field: string;
+    refresh_token_field: string;
+    discovery?: string;
+};
+
+// Returns the credential key whose value will be auto-filled by the
+// discovery step. Tool-specific lookup; add a branch when wiring a new
+// OAuth tool that needs auto-discovery (e.g. xero tenant_id).
+function discoveryTargetField(oauth: OAuthManifest, m: any): string | undefined {
+    if (oauth.discovery === "myob_company_files") {
+        const cred = (m.credentials ?? []).find((c: any) => c.key === "myob_business_id");
+        return cred ? "myob_business_id" : undefined;
+    }
+    return undefined;
+}
+
+function renderOAuthHelper(id: string, oauth: OAuthManifest): string {
+    return `
+      <div class="rounded-xl border border-blue-200 bg-blue-50 p-4 space-y-3"
+           data-oauth-helper
+           data-oauth-id="${escapeHtml(id)}"
+           data-client-id-field="cred-${escapeHtml(oauth.client_id_field)}"
+           data-client-secret-field="cred-${escapeHtml(oauth.client_secret_field)}"
+           data-refresh-token-field="cred-${escapeHtml(oauth.refresh_token_field)}"
+           data-authorize-url="${escapeHtml(oauth.authorize_url)}"
+           data-redirect-uri="${escapeHtml(oauth.redirect_uri)}"
+           data-scope="${escapeHtml(oauth.scope)}"
+           data-discovery="${escapeHtml(oauth.discovery ?? "")}">
+        <div>
+          <h4 class="font-medium text-slate-900">Authorize this integration</h4>
+          <p class="text-xs text-slate-600 mt-1" data-oauth-stage-help>Fill in <strong>API Key</strong> and <strong>API Secret</strong> above, then come back here.</p>
+        </div>
+
+        <!-- Stage 1 — kick off the OAuth dance ─────────────────────────── -->
+        <div data-oauth-stage="1">
+          <a href="#" data-oauth-authorize
+             class="pointer-events-none opacity-50 block w-full text-center px-4 py-3 rounded-lg font-medium text-sm bg-slate-900 text-white hover:bg-slate-700"
+             target="_blank" rel="noopener noreferrer">Sign in with provider →</a>
+          <p class="text-xs text-slate-500 mt-2" data-oauth-authorize-hint>(enter API Key first to enable)</p>
+        </div>
+
+        <!-- Stage 2 — paste the redirected URL back ────────────────────── -->
+        <div data-oauth-stage="2" class="hidden space-y-2">
+          <div class="rounded-lg bg-white border border-amber-300 p-3 text-xs text-slate-700 space-y-1">
+            <p class="font-medium text-slate-900">After you sign in, the browser will try to load <code class="px-1 rounded bg-slate-100">${escapeHtml(oauth.redirect_uri)}/?code=…</code> and show a "this site can't be reached" error.</p>
+            <p>That's expected — nothing is listening at that address. The address bar will still contain the full URL with the code we need.</p>
+            <p><strong>Copy the entire URL from the address bar</strong> (click the address bar, then <kbd class="px-1 rounded bg-slate-100 border border-slate-200">Ctrl</kbd>+<kbd class="px-1 rounded bg-slate-100 border border-slate-200">A</kbd>, <kbd class="px-1 rounded bg-slate-100 border border-slate-200">Ctrl</kbd>+<kbd class="px-1 rounded bg-slate-100 border border-slate-200">C</kbd>) and paste it below:</p>
+          </div>
+          <div class="flex gap-2">
+            <input data-oauth-redirect-input type="text" autocomplete="off" spellcheck="false"
+                   placeholder="${escapeHtml(oauth.redirect_uri)}/?code=..."
+                   class="flex-1 min-w-0 rounded-lg border border-slate-300 px-3 py-2 font-mono text-xs">
+            <button type="button" data-oauth-exchange
+                    class="shrink-0 px-3 py-2 rounded-lg font-medium text-sm bg-emerald-600 text-white hover:bg-emerald-500 disabled:opacity-50">
+              Continue
+            </button>
+          </div>
+        </div>
+
+        <!-- Stage 3 — discovery picker (only shown when >1 result) ──────── -->
+        <div data-oauth-stage="3" class="hidden space-y-2">
+          <label class="block text-sm font-medium text-slate-900" data-oauth-discovery-label>Choose:</label>
+          <select data-oauth-discovery-select
+                  class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm bg-white"></select>
+        </div>
+
+        <div data-oauth-status class="text-xs hidden"></div>
+      </div>
+      <script>
+      (function () {
+        const helper = document.querySelector('[data-oauth-helper][data-oauth-id="${escapeHtml(id)}"]');
+        if (!helper) return;
+        const id = helper.dataset.oauthId;
+        const clientIdInput     = document.getElementById(helper.dataset.clientIdField);
+        const clientSecretInput = document.getElementById(helper.dataset.clientSecretField);
+        const refreshInput      = document.getElementById(helper.dataset.refreshTokenField);
+        const authorizeBaseUrl  = helper.dataset.authorizeUrl;
+        const redirectUri       = helper.dataset.redirectUri;
+        const scope             = helper.dataset.scope;
+        const authorizeBtn      = helper.querySelector('[data-oauth-authorize]');
+        const authorizeHint     = helper.querySelector('[data-oauth-authorize-hint]');
+        const stageHelp         = helper.querySelector('[data-oauth-stage-help]');
+        const stage1            = helper.querySelector('[data-oauth-stage="1"]');
+        const stage2            = helper.querySelector('[data-oauth-stage="2"]');
+        const stage3            = helper.querySelector('[data-oauth-stage="3"]');
+        const redirectInput     = helper.querySelector('[data-oauth-redirect-input]');
+        const exchangeBtn       = helper.querySelector('[data-oauth-exchange]');
+        const discoverySelect   = helper.querySelector('[data-oauth-discovery-select]');
+        const discoveryLabel    = helper.querySelector('[data-oauth-discovery-label]');
+        const statusEl          = helper.querySelector('[data-oauth-status]');
+
+        function showStage(n) {
+          [stage1, stage2, stage3].forEach((el, i) => {
+            if (!el) return;
+            if (i + 1 === n) el.classList.remove('hidden');
+            else el.classList.add('hidden');
+          });
+        }
+
+        function buildAuthorizeUrl() {
+          const cid = (clientIdInput && clientIdInput.value || '').trim();
+          if (!cid) return '';
+          const params = new URLSearchParams({
+            client_id: cid,
+            redirect_uri: redirectUri,
+            response_type: 'code',
+            scope: scope,
+          });
+          return authorizeBaseUrl + '?' + params.toString();
+        }
+
+        function refreshAuthorizeBtn() {
+          const cid = (clientIdInput && clientIdInput.value || '').trim();
+          const csec = (clientSecretInput && clientSecretInput.value || '').trim();
+          const url = buildAuthorizeUrl();
+          if (url && csec) {
+            authorizeBtn.href = url;
+            authorizeBtn.classList.remove('pointer-events-none', 'opacity-50');
+            authorizeHint.textContent = 'Opens the provider in a new tab. Come back here once you see the "site can\\'t be reached" error.';
+          } else {
+            authorizeBtn.removeAttribute('href');
+            authorizeBtn.classList.add('pointer-events-none', 'opacity-50');
+            authorizeHint.textContent = url ? '(enter API Secret first to enable)' : '(enter API Key first to enable)';
+          }
+        }
+
+        function setStatus(kind, text) {
+          statusEl.classList.remove('hidden', 'text-slate-600', 'text-red-600', 'text-emerald-700');
+          statusEl.classList.add(
+            kind === 'error' ? 'text-red-600' :
+            kind === 'success' ? 'text-emerald-700' : 'text-slate-600'
+          );
+          statusEl.textContent = text;
+        }
+
+        function clearStatus() { statusEl.classList.add('hidden'); statusEl.textContent = ''; }
+
+        function setHiddenValue(fieldName, value) {
+          const el = document.getElementById('cred-' + fieldName);
+          if (el) el.value = value;
+        }
+
+        if (clientIdInput) clientIdInput.addEventListener('input', refreshAuthorizeBtn);
+        if (clientSecretInput) clientSecretInput.addEventListener('input', refreshAuthorizeBtn);
+        refreshAuthorizeBtn();
+
+        // Reveal the paste-redirect-URL stage once the user actually clicks
+        // the authorize link. Doing it on click means we don't show the
+        // confusing paste box before the user even sees the provider screen.
+        if (authorizeBtn) authorizeBtn.addEventListener('click', () => {
+          if (authorizeBtn.classList.contains('pointer-events-none')) return;
+          showStage(2);
+          stageHelp.innerHTML = 'After you sign in, copy the URL from the failed-page address bar and paste it below.';
+        });
+
+        if (exchangeBtn) exchangeBtn.addEventListener('click', async () => {
+          const url = (redirectInput.value || '').trim();
+          const cid = (clientIdInput && clientIdInput.value || '').trim();
+          const csec = (clientSecretInput && clientSecretInput.value || '').trim();
+          if (!url) { setStatus('error', 'Paste the redirect URL first.'); return; }
+          if (!cid || !csec) { setStatus('error', 'API Key / Secret above are missing.'); return; }
+          exchangeBtn.disabled = true;
+          setStatus('info', 'Exchanging code for refresh token…');
+          try {
+            const r = await fetch('/integrations/' + id + '/oauth-exchange', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ client_id: cid, client_secret: csec, redirect_url: url }),
+            });
+            const data = await r.json();
+            if (!r.ok || !data.refresh_token) {
+              setStatus('error', data.error || ('Exchange failed (' + r.status + ')'));
+              exchangeBtn.disabled = false;
+              return;
+            }
+            if (refreshInput) refreshInput.value = data.refresh_token;
+
+            const opts = data.discovery_options || [];
+            const target = data.discovery_target_field;
+            if (target && opts.length === 1) {
+              // Exactly one match — silently auto-fill, no UI noise.
+              setHiddenValue(target, opts[0].value);
+              showStage(0);
+              stageHelp.innerHTML = '<span class="text-emerald-700 font-medium">✓ Authorized.</span> Click <strong>Activate</strong> below to save.';
+              clearStatus();
+            } else if (target && opts.length > 1) {
+              // Multiple matches — let the user pick.
+              discoveryLabel.textContent = 'Multiple options were discovered — choose one:';
+              discoverySelect.innerHTML = '';
+              for (const opt of opts) {
+                const o = document.createElement('option');
+                o.value = opt.value;
+                o.textContent = opt.label;
+                discoverySelect.appendChild(o);
+              }
+              setHiddenValue(target, discoverySelect.value);
+              discoverySelect.addEventListener('change', () => setHiddenValue(target, discoverySelect.value));
+              showStage(3);
+              stageHelp.innerHTML = '<span class="text-emerald-700 font-medium">✓ Authorized.</span> Pick the right option, then click <strong>Activate</strong> below.';
+              clearStatus();
+            } else if (target && opts.length === 0) {
+              // Discovery declared but returned nothing — surface the
+              // hidden field so the operator can type the value by hand.
+              showStage(0);
+              const wrapper = document.querySelector('[data-cred="' + target + '"]');
+              const input   = document.getElementById('cred-' + target);
+              if (wrapper) wrapper.classList.remove('hidden');
+              if (input)  { input.type = 'text'; input.required = true; }
+              stageHelp.innerHTML = '<span class="text-amber-700 font-medium">Authorized,</span> but auto-discovery returned no options — please fill the remaining field by hand and click Activate.';
+              clearStatus();
+            } else {
+              // Manifest declares no discovery — only the refresh_token
+              // was hidden, and it's now populated. Operator just clicks
+              // Activate.
+              showStage(0);
+              stageHelp.innerHTML = '<span class="text-emerald-700 font-medium">✓ Authorized.</span> Click <strong>Activate</strong> below to save.';
+              clearStatus();
+            }
+          } catch (e) {
+            setStatus('error', String(e));
+            exchangeBtn.disabled = false;
+          }
+        });
+      })();
+      </script>
+    `;
+}
+
 app.get("/integrations/:id/activate", (c) => {
     const id = c.req.param("id");
     const m = loadManifest(id);
     if (!m) return c.html(errorPage("No such integration"));
-    const credFields = (m.credentials ?? []).map((cred: any) => `
-        <div>
+    const oauth = m.oauth as OAuthManifest | undefined;
+    const discoveryTarget = oauth ? discoveryTargetField(oauth, m) : undefined;
+    const credFields = (m.credentials ?? []).map((cred: any) => {
+        // Refresh-token + discovery-target fields are JS-populated by the
+        // OAuth helper, so we render them as hidden inputs the operator
+        // never sees. They still post on submit. The discovery-target
+        // wrapper carries data-cred so the JS can re-surface it as a
+        // visible input if discovery returns zero options.
+        const isAutoFilled = !!oauth && (
+            cred.key === oauth.refresh_token_field ||
+            (!!discoveryTarget && cred.key === discoveryTarget)
+        );
+        if (isAutoFilled) {
+            return `
+        <div data-cred="${escapeHtml(cred.key)}" class="hidden">
+          <label class="block text-sm font-medium mb-1">${escapeHtml(cred.label ?? cred.key)}</label>
+          <input id="cred-${escapeHtml(cred.key)}" name="${escapeHtml(cred.key)}"
+                 type="hidden">
+        </div>
+    `;
+        }
+        return `
+        <div data-cred="${escapeHtml(cred.key)}">
           <label class="block text-sm font-medium mb-1">${escapeHtml(cred.label ?? cred.key)}${cred.secret ? " <span class='text-xs text-slate-400 font-normal'>(secret)</span>" : ""}</label>
-          <input name="${escapeHtml(cred.key)}" required
+          <input id="cred-${escapeHtml(cred.key)}" name="${escapeHtml(cred.key)}" required
                  ${cred.secret ? 'type="password" autocomplete="new-password"' : 'type="text" autocomplete="off"'}
                  spellcheck="false" autocapitalize="off" autocorrect="off"
                  data-1p-ignore data-lpignore="true" data-bwignore="true"
                  class="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm">
           ${cred.description ? `<p class="text-xs text-slate-500 mt-1">${escapeHtml(cred.description)}</p>` : ""}
         </div>
-    `).join("");
+    `;}).join("");
     const toolsDir = process.env.AGENTHQ_TOOLS_DIR ?? "/opt/agents/tools";
     const setupPath = `${toolsDir}/${id}/setup.md`;
     const setupMd = existsSync(setupPath) ? readFileSync(setupPath, "utf8") : "";
+    const oauthHelper = oauth ? renderOAuthHelper(id, oauth) : "";
 
     return c.html(layout(`Activate ${m.title ?? id}`, `
         <div class="mb-6">
@@ -719,6 +988,7 @@ app.get("/integrations/:id/activate", (c) => {
             <p class="text-xs text-slate-500 mb-4">Encrypted into the systemd-creds vault. Never logged or echoed.</p>
             <form method="POST" action="/integrations/${id}/activate" class="space-y-4">
               ${credFields}
+              ${oauthHelper}
               <div class="pt-2 flex gap-2">
                 ${button(`Activate`)}
                 ${button("Cancel", { href: `/integrations/${id}`, intent: "secondary" })}
@@ -727,6 +997,131 @@ app.get("/integrations/:id/activate", (c) => {
           </div>
         </div>
     `, "integrations", c.get("user")));
+});
+
+// POST /integrations/:id/oauth-exchange
+//
+// Called by the OAuth helper JS in the activate page. Body shape:
+//   { client_id, client_secret, redirect_url }
+// where redirect_url is the FULL pasted URL the upstream provider
+// redirected the user to (e.g. http://localhost/?code=ABC...). The
+// handler parses the `code` out of the URL, POSTs to oauth.token_url
+// with grant_type=authorization_code, returns the refresh_token, and —
+// if the manifest declares a discovery hook — runs that hook with the
+// freshly-acquired access_token to populate dependent fields.
+app.post("/integrations/:id/oauth-exchange", async (c) => {
+    const id = c.req.param("id");
+    const m = loadManifest(id);
+    if (!m || !m.oauth) {
+        return c.json({ error: "Integration has no OAuth configuration" }, 400);
+    }
+    const oauth = m.oauth as OAuthManifest;
+
+    let body: { client_id?: string; client_secret?: string; redirect_url?: string };
+    try { body = await c.req.json(); } catch { return c.json({ error: "Invalid JSON body" }, 400); }
+    const clientId = (body.client_id ?? "").trim();
+    const clientSecret = (body.client_secret ?? "").trim();
+    const redirectUrl = (body.redirect_url ?? "").trim();
+    if (!clientId || !clientSecret || !redirectUrl) {
+        return c.json({ error: "client_id, client_secret, and redirect_url are required" }, 400);
+    }
+
+    // Pull `code` out of the pasted URL. If the user happened to copy
+    // just the bare code instead of the whole URL, accept that too —
+    // URL parsing rejects bare strings, so sniff for a leading scheme.
+    let code: string | null = null;
+    if (/^https?:\/\//i.test(redirectUrl)) {
+        try { code = new URL(redirectUrl).searchParams.get("code"); }
+        catch { return c.json({ error: "Could not parse the URL you pasted." }, 400); }
+    } else if (redirectUrl.length > 4 && !redirectUrl.includes(" ")) {
+        code = redirectUrl;
+    }
+    if (!code) {
+        return c.json({ error: "No `code` parameter found in the pasted URL. Make sure you copied the full URL the browser ended on after sign-in." }, 400);
+    }
+
+    // Exchange code → tokens. Form-encoded per OAuth2 spec.
+    const tokenForm = new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        redirect_uri: oauth.redirect_uri,
+        code,
+        grant_type: "authorization_code",
+    });
+    let tokenResp: Response;
+    try {
+        tokenResp = await fetch(oauth.token_url, {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: tokenForm.toString(),
+        });
+    } catch (e) {
+        return c.json({ error: `Could not reach ${oauth.token_url}: ${String(e)}` }, 502);
+    }
+    const tokenText = await tokenResp.text();
+    if (!tokenResp.ok) {
+        return c.json({ error: `Token exchange failed (${tokenResp.status}): ${tokenText.slice(0, 400)}` }, 400);
+    }
+    let tokenData: any;
+    try { tokenData = JSON.parse(tokenText); }
+    catch { return c.json({ error: `Token endpoint returned non-JSON: ${tokenText.slice(0, 200)}` }, 502); }
+    const refreshToken = tokenData.refresh_token;
+    const accessToken = tokenData.access_token;
+    if (!refreshToken) {
+        return c.json({ error: `Token response did not include a refresh_token. Make sure the requested scope includes offline_access.` }, 400);
+    }
+
+    // Optional discovery hook — runs with the access token we just got.
+    // Best-effort: a discovery failure leaves the field as a plain text
+    // input so the user can still type the value by hand.
+    let discoveryOptions: { value: string; label: string }[] | undefined;
+    let discoveryTarget: string | undefined;
+    if (oauth.discovery === "myob_company_files" && accessToken) {
+        // The endpoint returns a top-level JSON array of CompanyFile records.
+        // We log the response shape on every call so a parsing surprise is
+        // diagnosable from journalctl rather than silently re-prompting the
+        // operator for a GUID they shouldn't have to know.
+        try {
+            const r = await fetch("https://api.myob.com/accountright/", {
+                headers: {
+                    "Authorization": `Bearer ${accessToken}`,
+                    "x-myobapi-key": clientId,
+                    "x-myobapi-version": "v2",
+                    "Accept": "application/json",
+                },
+            });
+            const bodyText = await r.text();
+            console.log(`[oauth-discovery:${id}] status=${r.status} body=${bodyText.slice(0, 800)}`);
+            if (r.ok && bodyText) {
+                let files: any;
+                try { files = JSON.parse(bodyText); } catch { files = null; }
+                // Accept top-level array, OData-style {value: [...]}, or
+                // {Items: [...]}. Each CompanyFile has Uri (ending /<GUID>)
+                // or Id; some responses use lowercase. Be liberal.
+                let arr: any[] = [];
+                if (Array.isArray(files)) arr = files;
+                else if (Array.isArray(files?.value)) arr = files.value;
+                else if (Array.isArray(files?.Items)) arr = files.Items;
+                discoveryOptions = arr.map((f: any) => {
+                    const uri: string = f.Uri ?? f.uri ?? "";
+                    const guid = (uri.split("/").filter(Boolean).pop() ?? "")
+                                 || f.Id || f.id || "";
+                    const name = f.Name ?? f.name ?? guid;
+                    const country = (f.Country ?? f.country) ? ` — ${f.Country ?? f.country}` : "";
+                    return { value: String(guid), label: `${name}${country}` };
+                }).filter((o) => o.value);
+                discoveryTarget = "myob_business_id";
+            }
+        } catch (e) {
+            console.log(`[oauth-discovery:${id}] error=${String(e)}`);
+        }
+    }
+
+    return c.json({
+        refresh_token: refreshToken,
+        discovery_options: discoveryOptions,
+        discovery_target_field: discoveryTarget,
+    });
 });
 
 app.post("/integrations/:id/activate", async (c) => {
