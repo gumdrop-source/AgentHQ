@@ -57,6 +57,24 @@
     "gigafy_portal_create_supplier": {
       "description": "Create (PUT) a supplier in the Portal — pass the JSON payload",
       "destructive": true
+    },
+    "gigafy_portal_inbox_list": {
+      "description": "List pending AP-invoice drafts in the Portal Inbox"
+    },
+    "gigafy_portal_inbox_load": {
+      "description": "Load an inbox draft by integer ID, plus reference data (suppliers, ledger accounts, tax groups, work orders, stock)"
+    },
+    "gigafy_portal_inbox_save": {
+      "description": "Create or update an AP-invoice draft in the Portal Inbox — flat shape, single line item",
+      "destructive": true
+    },
+    "gigafy_portal_inbox_raise": {
+      "description": "Convert an inbox draft into a real Purchase Invoice — the actual create step",
+      "destructive": true
+    },
+    "gigafy_portal_inbox_delete": {
+      "description": "Delete an inbox draft (reversible — you can re-create)",
+      "destructive": true
     }
   }
 }
