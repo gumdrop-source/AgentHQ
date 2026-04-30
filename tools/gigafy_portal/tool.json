@@ -33,6 +33,34 @@
   "tools": {
     "gigafy_portal_ping": {
       "description": "Connectivity sanity check — mints a fresh access token and reports who we authenticated as"
+    },
+    "gigafy_portal_supplier_lookup": {
+      "description": "Find suppliers by name fragment — resolves a vendor name into the supplierEntityId GUID"
+    },
+    "gigafy_portal_stock_lookup": {
+      "description": "Find stock / catalogue items by name or code — resolves stockEntityId for a line item"
+    },
+    "gigafy_portal_account_lookup": {
+      "description": "Find chart-of-accounts ledger accounts by name or code — resolves coaEntityId / coaCode for a line item"
+    },
+    "gigafy_portal_tax_group_list": {
+      "description": "List every tax group on the reseller — used to pick taxGroupEntityId (typically GST or N-T)"
+    },
+    "gigafy_portal_work_order_lookup": {
+      "description": "Find a work order / job ticket by free-text — optional, only used when attributing a cost to a job"
+    },
+    "gigafy_portal_invoice_blank": {
+      "description": "Empty purchase-invoice template — the JSON skeleton the Portal expects when creating"
+    },
+    "gigafy_portal_invoice_history": {
+      "description": "Recent invoices from one supplier — for learning prior coding before composing a new invoice"
+    },
+    "gigafy_portal_invoice_load": {
+      "description": "Load a purchase invoice by GUID — full record including line items and attachments"
+    },
+    "gigafy_portal_create_purchase_invoice": {
+      "description": "Create a purchase invoice (PUT /Invoices) — flat header with stringified items array",
+      "destructive": true
     }
   }
 }

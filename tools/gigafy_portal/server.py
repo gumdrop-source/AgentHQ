@@ -240,6 +240,184 @@ def gigafy_portal_ping() -> dict:
     }
 
 
+# ─── lookups (research tools the bot uses before composing an invoice) ────
+
+@mcp.tool()
+def gigafy_portal_supplier_lookup(query: str) -> Any:
+    """Find suppliers by name fragment. Use to resolve a vendor name from
+    an invoice into the supplierEntityId the create payload needs.
+
+    Args:
+        query: Substring of the supplier name (case-insensitive on the
+            server side).
+    """
+    if not query:
+        raise ValueError("query is required")
+    return _get(f"/api/Suppliers/{RESELLER_ID}/Lookup", params={"query": query})
+
+
+@mcp.tool()
+def gigafy_portal_stock_lookup(query: str, filter: int = 0) -> Any:
+    """Find stock / catalogue items by name or code fragment. Each line
+    item on a purchase invoice references one stockEntityId.
+
+    Args:
+        query: Substring to search on (name or product code).
+        filter: Optional Int16 server-side filter category (default 0).
+    """
+    if not query:
+        raise ValueError("query is required")
+    return _get(
+        f"/api/Stock/{RESELLER_ID}/Lookup",
+        params={"query": query, "filter": filter},
+    )
+
+
+@mcp.tool()
+def gigafy_portal_account_lookup(query: str) -> Any:
+    """Find chart-of-accounts entries (ledger accounts) by name or code
+    fragment. Each invoice line item is coded against one account
+    (its coaEntityId / coaCode).
+
+    Args:
+        query: Substring of the account name or display ID. For example
+            'rent' or '6-' (account-code prefix).
+    """
+    if not query:
+        raise ValueError("query is required")
+    return _get(
+        f"/api/Resellers/{RESELLER_ID}/Ledger/Accounts/Lookup",
+        params={"query": query},
+    )
+
+
+@mcp.tool()
+def gigafy_portal_tax_group_list() -> Any:
+    """List every tax group configured for the reseller. Each invoice
+    line item references one taxGroupEntityId — typically GST or N-T
+    (no tax) for Australian customers.
+
+    Returns the full set; no filtering needed since the list is short
+    (a handful of groups per reseller).
+    """
+    return _get(f"/api/Resellers/{RESELLER_ID}/TaxGroups")
+
+
+@mcp.tool()
+def gigafy_portal_work_order_lookup(criteria: str) -> Any:
+    """Find work orders / job tickets by free-text search. Optional —
+    only set ticketEntityId on a line item if the operator wants to
+    attribute the cost to a specific job.
+
+    Note: this endpoint is POST + body=string (not query param).
+    """
+    if not criteria:
+        raise ValueError("criteria is required")
+    return _post(f"/api/WorkOrders/{RESELLER_ID}/Search", body=criteria)
+
+
+# ─── purchase-invoice composition + create ─────────────────────────────────
+
+@mcp.tool()
+def gigafy_portal_invoice_blank() -> dict:
+    """Get an empty purchase-invoice template for the configured reseller.
+
+    Returns the JSON skeleton the Portal expects for a new invoice —
+    pre-allocated entityId, default fields, empty table1/table2 arrays.
+    Use as the starting point for composing a create payload.
+    """
+    return _get(f"/api/Purchases/Invoices/{RESELLER_ID}/Blank")
+
+
+@mcp.tool()
+def gigafy_portal_invoice_history(supplier_entity_id: str, limit: int = 10) -> Any:
+    """List recent purchase invoices from one supplier — for
+    "learn from prior coding" when filling in a new invoice.
+
+    Returns the matching invoice rows (header summary). Use the entityId
+    on a row to drill into a full invoice via gigafy_portal_invoice_load,
+    then crib the line item shape (stockEntityId / coaEntityId /
+    taxGroupEntityId / taxes JSON) for the new invoice.
+
+    Args:
+        supplier_entity_id: GUID of the supplier — get it from
+            gigafy_portal_supplier_lookup.
+        limit: Max rows to return (1–50, default 10).
+    """
+    if not supplier_entity_id:
+        raise ValueError("supplier_entity_id is required")
+    listing = _post(
+        f"/api/Purchases/Invoices/{RESELLER_ID}/{ZERO_GUID}",
+        body={},
+    )
+    rows = (listing or {}).get("table", [])
+    matches = [r for r in rows if r.get("supplierEntityId") == supplier_entity_id]
+    matches.sort(key=lambda r: r.get("purchaseDate") or "", reverse=True)
+    return matches[: max(1, min(limit, 50))]
+
+
+@mcp.tool()
+def gigafy_portal_invoice_load(entity_id: str) -> dict:
+    """Load one purchase invoice by GUID. Returns the full record
+    including table1 (line items) and table2 (attachments).
+
+    Use to inspect a prior invoice's line-item coding before composing
+    a new one — read a similar prior invoice from the same supplier
+    and copy its stockEntityId / coaEntityId / taxGroupEntityId /
+    taxRateEntityId fields.
+    """
+    if not entity_id:
+        raise ValueError("entity_id is required")
+    return _get(f"/api/Purchases/Invoices/{entity_id}")
+
+
+@mcp.tool()
+def gigafy_portal_create_purchase_invoice(invoice_json: str) -> dict:
+    """Create a purchase invoice in the Portal.
+
+    DESTRUCTIVE — writes directly to the live Portal. Always show the
+    operator the full JSON preview and get explicit confirmation before
+    calling.
+
+    Important: the front-end sends a FLAT header object where line items
+    live as a STRINGIFIED JSON ARRAY in `header.items`, not as a separate
+    table1 array. Specifically:
+
+      const rows = [/* array of line item objects */];
+      header.saleLocation = JSON.stringify(saleLocation);
+      header.items        = JSON.stringify(rows);
+      PUT /api/Purchases/Invoices    body = header
+
+    Recommended pattern:
+      1. supplier_lookup → resolve supplierEntityId
+      2. invoice_history(supplier_id) → find a similar prior invoice
+      3. invoice_load(prior_id) → read its table1 line items
+      4. invoice_blank() → fresh header skeleton (its entityId is
+         pre-allocated; use it as parentEntityId on each new line item)
+      5. Copy the prior coding fields onto your new line items, swap
+         in the new productName / productCost / total / quantity / GST
+      6. Build the flat header object: copy from blank's table[0],
+         set supplierEntityId, invoiceNumber, invoiceDate, dueDate,
+         saleLocation (stringify it), items (stringify the line items)
+      7. Show the operator a preview, ask "save?"
+      8. On explicit yes, call this tool with the JSON-encoded header
+
+    Args:
+        invoice_json: JSON-encoded flat header object. `items` should be
+            a JSON-encoded STRING (a stringified array of line items),
+            not an array. `saleLocation` likewise stringified.
+
+    Response shape: {item1: bool, item2: string} — Tuple<success, message>.
+    """
+    try:
+        body = json.loads(invoice_json)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"invoice_json is not valid JSON: {e}") from e
+    if not isinstance(body, dict):
+        raise ValueError("invoice_json must encode a JSON object")
+    return _put("/api/Purchases/Invoices", body)
+
+
 # ─── entry ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
