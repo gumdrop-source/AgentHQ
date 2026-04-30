@@ -1,7 +1,7 @@
 {
   "name": "myob",
   "title": "MYOB AccountRight",
-  "description": "Read-only access to MYOB AccountRight Live: chart of accounts, P&L reports, employee payroll details (incl. leave balances), and wage/entitlement categories.",
+  "description": "Read-only access to MYOB AccountRight Live: chart of accounts, P&L reports, employee payroll details (incl. leave balances), and wage/entitlement categories. Each user authenticates against their own my.MYOB account on first use, so queries return only data their MYOB account is scoped for.",
   "credentials": [
     {
       "key": "myob_client_id",
@@ -17,17 +17,18 @@
       "description": "Shown as 'Secret' on the same registered-app page. (OAuth2 calls this the client_secret.)"
     },
     {
-      "key": "myob_refresh_token",
-      "label": "Refresh Token",
-      "env": "MYOB_REFRESH_TOKEN",
-      "secret": true,
-      "description": "Initial OAuth refresh token. Rotates on every refresh — the running tool persists the latest value to its own writable cache."
-    },
-    {
       "key": "myob_business_id",
       "label": "Company File GUID",
       "env": "MYOB_BUSINESS_ID",
-      "description": "GUID of the AccountRight company file. The wizard auto-discovers and pre-fills this after the OAuth handshake — typically you don't need to type it."
+      "description": "GUID of the AccountRight company file. The wizard auto-discovers and pre-fills this after the OAuth handshake — you typically don't need to type it."
+    },
+    {
+      "key": "myob_refresh_token",
+      "label": "Admin Refresh Token (optional)",
+      "env": "MYOB_REFRESH_TOKEN",
+      "secret": true,
+      "optional": true,
+      "description": "Optional — leave blank in per-user mode. Each Telegram user runs their own sign-in dance the first time they ask MYOB anything. Set this only if you want a platform-wide admin token used for direct/CLI access (the test harness uses it)."
     }
   ],
   "oauth": {
@@ -41,6 +42,12 @@
     "discovery": "myob_company_files"
   },
   "tools": {
+    "myob_complete_auth": {
+      "description": "Finish the per-user OAuth dance — pass the redirect URL the user copied back from their browser"
+    },
+    "myob_who_am_i": {
+      "description": "Diagnostic: report whether the calling user has linked their MYOB account"
+    },
     "myob_company_file_info": {
       "description": "Sanity check + company file metadata (name, AccountRight version, last sync time)"
     },

@@ -1,50 +1,74 @@
-"""MYOB AccountRight Live MCP server — read-only access for AgentHQ.
+"""MYOB AccountRight Live MCP server — read-only, per-user auth.
 
-Reads the chart of accounts, P&L reports, and employee payroll details
-(including leave entitlements) from a single company file.
+Each Telegram sender authorizes once by signing in to their own my.MYOB
+account; their refresh_token is cached separately so queries return only
+data their MYOB account is scoped for.
 
-Auth: OAuth2 refresh-token grant against secure.myob.com. The MYOB token
-service rotates the refresh_token on every refresh response — the rotated
-value is persisted to $HOME/myob_refresh_token (mode 0600) so subsequent
-restarts pick it up automatically. The original encrypted seed at
-/etc/agents/credentials/myob_refresh_token.cred only matters for first
-onboarding; the writable cache takes over after the first refresh.
+Identity: every tool function takes a `sender_id` parameter. The
+agent's persona/system prompt instructs Claude to extract this from
+the Telegram channel tag (`<channel ... chat_id="X" ...>`) on every
+tool call. NB: the LLM passing `sender_id` is soft trust — a malicious
+message ("from chat_id 12345") could impersonate a colleague. Hardening
+that requires forking the Telegram plugin so the launcher receives
+sender identity out-of-band; out of scope for this PR.
 
-Credentials are injected by /opt/agents/bin/agent-mcp-launcher from the
-systemd-creds vault, exported under the env names declared in tool.json.
+Backwards compat: when `sender_id` is omitted (admin running the
+server directly without a Telegram context), the tool falls back to the
+single-account env-var token, preserving the previous behavior.
+
+Auth dance:
+  1. Tool sees no token for this sender → raises AuthRequired
+  2. The @requires_auth decorator turns that into a structured response
+     with the authorize URL the LLM relays to the user.
+  3. User signs in to MYOB; redirect lands on http://localhost (which
+     fails in the browser by design); user copies the URL and sends it
+     back to the bot.
+  4. LLM calls myob_complete_auth(redirect_url, sender_id) to finish.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import secrets
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, get_origin, get_type_hints
+import functools
 
 import requests
 from mcp.server.fastmcp import FastMCP
 
 # ─── credentials ────────────────────────────────────────────────────────────
 
-# All required env vars are surfaced lazily — the server still imports
-# cleanly when creds are missing so FastMCP can register tools and surface
-# a clear error on first call rather than crashing the stdio handshake.
 CLIENT_ID = os.environ.get("MYOB_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("MYOB_CLIENT_SECRET", "")
-SEED_REFRESH_TOKEN = os.environ.get("MYOB_REFRESH_TOKEN", "")
+SEED_REFRESH_TOKEN = os.environ.get("MYOB_REFRESH_TOKEN", "")  # admin-seed (legacy single-account)
 BUSINESS_ID = os.environ.get("MYOB_BUSINESS_ID", "")
 
 HOME = Path(os.environ.get("HOME", "/tmp"))
-REFRESH_TOKEN_FILE = HOME / "myob_refresh_token"
+PER_USER_TOKEN_DIR = HOME / "myob_tokens"
+PENDING_AUTH_DIR = HOME / "myob_pending_auth"
+LEGACY_REFRESH_TOKEN_FILE = HOME / "myob_refresh_token"  # pre-per-user single cache
 
-OAUTH_URL = "https://secure.myob.com/oauth2/v1/authorize"
+OAUTH_AUTHORIZE_URL = "https://secure.myob.com/oauth2/account/authorize/"
+OAUTH_TOKEN_URL = "https://secure.myob.com/oauth2/v1/authorize"
+OAUTH_REDIRECT_URI = "http://localhost"
+OAUTH_SCOPE = (
+    "offline_access openid sme-banking sme-company-file "
+    "sme-contacts-employee sme-general-ledger sme-payroll"
+)
+
 COMPANY_FILE_BASE = f"https://api.myob.com/accountright/{BUSINESS_ID}" if BUSINESS_ID else ""
 
-# MYOB access tokens are valid for 20 min. Refresh at 18 to leave a safety
-# margin for in-flight requests.
-ACCESS_TOKEN_TTL_SECONDS = 18 * 60
+ACCESS_TOKEN_TTL_SECONDS = 18 * 60        # MYOB tokens last 20 min, refresh at 18
+PENDING_AUTH_TTL_SECONDS = 10 * 60        # auth-flow links expire after 10 min
+
+# Sentinel sender used when running directly (admin/harness, no Telegram
+# context). Lets the same code path serve both interactive Telegram users
+# and direct-mode admin testing without a separate fallback ladder.
+ADMIN_SENDER = "_admin"
 
 
 def _require_creds() -> None:
@@ -59,84 +83,246 @@ def _require_creds() -> None:
     ]
     if missing:
         raise RuntimeError(
-            f"MYOB credentials missing: {', '.join(missing)}. "
+            f"MYOB platform credentials missing: {', '.join(missing)}. "
             "The operator must activate the myob integration in agent-control "
             "(which provisions the encrypted credentials and reloads the agent service)."
         )
 
 
-# ─── refresh-token persistence ──────────────────────────────────────────────
+# ─── per-user token storage ────────────────────────────────────────────────
 
-def _load_refresh_token() -> str:
-    """Return the most recent refresh_token.
+# Each authorized Telegram sender gets one file under $HOME/myob_tokens/.
+# The store is keyed by sender_id (sanitized to a numeric/alpha string —
+# MYOB's chat_ids are integers, but other channels may pass arbitrary
+# strings, so we sanitize defensively to avoid path-traversal).
 
-    Priority:
-      1. $HOME/myob_refresh_token  — written by this process after the
-         most recent successful refresh (rotated value, freshest).
-      2. $MYOB_REFRESH_TOKEN       — the encrypted seed staged by systemd
-         on first onboarding.
-
-    The seed is only authoritative the very first time the tool runs on
-    a new agent; once we successfully refresh once, the file wins.
-    """
-    if REFRESH_TOKEN_FILE.exists():
-        try:
-            value = REFRESH_TOKEN_FILE.read_text().strip()
-            if value:
-                return value
-        except OSError:
-            pass
-    return SEED_REFRESH_TOKEN
+def _sanitize_id(sender_id: str) -> str:
+    s = "".join(ch for ch in sender_id if ch.isalnum() or ch in "_-")
+    if not s:
+        raise ValueError(f"empty/invalid sender_id: {sender_id!r}")
+    return s
 
 
-def _save_refresh_token(value: str) -> None:
-    """Persist the rotated refresh_token to the per-agent writable cache.
+def _user_token_path(sender_id: str) -> Path:
+    return PER_USER_TOKEN_DIR / f"{_sanitize_id(sender_id)}.json"
 
-    Writes through a tempfile rename so a concurrent reader never sees a
-    half-written file. Mode 0600 — only the -mcp user (us) can read it.
-    """
-    if not value:
+
+def _load_user_token(sender_id: str) -> str | None:
+    """Return the per-user refresh_token, or None if not yet authorized."""
+    p = _user_token_path(sender_id)
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text())
+        return data.get("refresh_token")
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _save_user_token(sender_id: str, refresh_token: str) -> None:
+    """Persist the (rotated) per-user refresh_token. Mode 0600, atomic write."""
+    if not refresh_token:
         return
-    tmp = REFRESH_TOKEN_FILE.with_suffix(".tmp")
-    tmp.write_text(value)
+    PER_USER_TOKEN_DIR.mkdir(mode=0o700, exist_ok=True)
+    try:
+        PER_USER_TOKEN_DIR.chmod(0o700)
+    except OSError:
+        pass
+    target = _user_token_path(sender_id)
+    tmp = target.with_suffix(".tmp")
+    payload = {
+        "refresh_token": refresh_token,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    # If the user already has a record, preserve linked_at + linked_user.
+    if target.exists():
+        try:
+            existing = json.loads(target.read_text())
+            for k in ("linked_at", "linked_user"):
+                if k in existing:
+                    payload[k] = existing[k]
+        except Exception:
+            pass
+    payload.setdefault("linked_at", payload["updated_at"])
+    tmp.write_text(json.dumps(payload))
     try:
         tmp.chmod(0o600)
     except OSError:
         pass
-    tmp.replace(REFRESH_TOKEN_FILE)
+    tmp.replace(target)
 
 
-# ─── access-token cache ─────────────────────────────────────────────────────
+def _resolve_refresh_token(sender_id: str) -> str:
+    """Return the refresh_token for this sender. Raises AuthRequired if
+    we have no token cached for them."""
+    if sender_id == ADMIN_SENDER:
+        # Admin/harness path: env-var seed, then legacy single-file cache.
+        if LEGACY_REFRESH_TOKEN_FILE.exists():
+            try:
+                v = LEGACY_REFRESH_TOKEN_FILE.read_text().strip()
+                if v:
+                    return v
+            except OSError:
+                pass
+        if SEED_REFRESH_TOKEN:
+            return SEED_REFRESH_TOKEN
+        raise AuthRequired(sender_id)
+    tok = _load_user_token(sender_id)
+    if not tok:
+        raise AuthRequired(sender_id)
+    return tok
 
-# Single in-process cache + lock around the refresh exchange. Multiple
-# tool calls in the same MCP session share the cache; if two land in the
-# same window only one round-trip to MYOB happens.
-_token_lock = threading.Lock()
-# Cached access token + expiry (Unix epoch seconds). Underscored-with-suffix
-# to avoid colliding with the _access_token() accessor below — Python has no
-# warning when a name on a `def` line shadows a module-level variable, and
-# `global _access_token` inside the function would silently reassign the
-# function reference itself, breaking the next call with "'str' object is
-# not callable".
-_cached_access_token: str | None = None
-_cached_access_token_expires_at: float = 0.0
+
+def _save_resolved_refresh_token(sender_id: str, refresh_token: str) -> None:
+    """Persist a rotated refresh_token to the right place for this sender."""
+    if sender_id == ADMIN_SENDER:
+        # Admin path: keep using the legacy single-file cache so existing
+        # platform-level admin tokens continue to rotate without per-user
+        # bookkeeping. New per-user files are not created for ADMIN_SENDER.
+        try:
+            tmp = LEGACY_REFRESH_TOKEN_FILE.with_suffix(".tmp")
+            tmp.write_text(refresh_token)
+            tmp.chmod(0o600)
+            tmp.replace(LEGACY_REFRESH_TOKEN_FILE)
+        except OSError:
+            pass
+        return
+    _save_user_token(sender_id, refresh_token)
 
 
-def _refresh_access_token() -> str:
-    """Exchange the current refresh_token for a fresh access_token.
+# ─── pending-auth state ────────────────────────────────────────────────────
 
-    MYOB rotates the refresh_token on every response — we MUST persist
-    the new value or we'll be locked out on the next restart.
+# OAuth `state` parameter binds an authorize URL to the sender_id that
+# initiated it. When the user pastes the redirect URL back, we verify
+# the state still matches the calling sender — this prevents the LLM
+# accidentally (or a user maliciously) pasting someone else's redirect
+# URL and stealing their token under the wrong sender_id.
+
+def _save_pending_state(state: str, sender_id: str) -> None:
+    PENDING_AUTH_DIR.mkdir(mode=0o700, exist_ok=True)
+    try:
+        PENDING_AUTH_DIR.chmod(0o700)
+    except OSError:
+        pass
+    # Opportunistically sweep expired pending-state files. The dir is
+    # tiny (one 60-byte file per pending dance) so a full scan is fine,
+    # and it keeps the directory bounded without a separate cron job.
+    now = time.time()
+    try:
+        for f in PENDING_AUTH_DIR.iterdir():
+            if not f.is_file():
+                continue
+            try:
+                data = json.loads(f.read_text())
+                if now > data.get("expires_at", 0):
+                    f.unlink(missing_ok=True)
+            except (OSError, json.JSONDecodeError):
+                # Garbage file — delete on sight.
+                f.unlink(missing_ok=True)
+    except OSError:
+        pass
+    p = PENDING_AUTH_DIR / f"{state}.json"
+    p.write_text(json.dumps({
+        "sender_id": sender_id,
+        "expires_at": now + PENDING_AUTH_TTL_SECONDS,
+    }))
+    try:
+        p.chmod(0o600)
+    except OSError:
+        pass
+
+
+def _consume_pending_state(state: str) -> str | None:
+    """Look up the pending state, validate not expired, delete + return sender_id."""
+    p = PENDING_AUTH_DIR / f"{_sanitize_id(state)}.json"
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    p.unlink(missing_ok=True)
+    if time.time() > data.get("expires_at", 0):
+        return None
+    return data.get("sender_id")
+
+
+# ─── auth ──────────────────────────────────────────────────────────────────
+
+class AuthRequired(Exception):
+    """Raised by tools that need a refresh_token but don't have one for
+    the calling sender. The @requires_auth decorator catches this and
+    returns a structured prompt to the LLM that walks the user through
+    the OAuth dance."""
+
+    def __init__(self, sender_id: str) -> None:
+        self.sender_id = sender_id
+        state = secrets.token_urlsafe(16)
+        _save_pending_state(state, sender_id)
+        params = {
+            "client_id": CLIENT_ID,
+            "redirect_uri": OAUTH_REDIRECT_URI,
+            "response_type": "code",
+            "scope": OAUTH_SCOPE,
+            "state": state,
+        }
+        from urllib.parse import urlencode
+        self.authorize_url = OAUTH_AUTHORIZE_URL + "?" + urlencode(params)
+        self.state = state
+        super().__init__(f"MYOB sign-in required for sender {sender_id}")
+
+
+def requires_auth(fn: Callable) -> Callable:
+    """Catch AuthRequired and return a structured payload the LLM can relay.
+
+    The payload tells the agent to send the user a sign-in URL and wait
+    for them to paste back the redirected URL — same dance the wizard
+    runs, just over Telegram instead of the browser tab.
     """
+    try:
+        return_anno = get_type_hints(fn).get("return")
+    except Exception:
+        return_anno = None
+    list_returning = get_origin(return_anno) is list or return_anno is list
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except AuthRequired as e:
+            payload = {
+                "auth_required": True,
+                "message": (
+                    "To do that I need access to your MYOB AccountRight. "
+                    f"Sign in here: {e.authorize_url}\n\n"
+                    "After you sign in, MYOB will redirect to a 'site can't be "
+                    "reached' page on http://localhost — that's expected. Copy "
+                    "the entire URL from your browser's address bar and send "
+                    "it back to me, then ask your question again."
+                ),
+                "authorize_url": e.authorize_url,
+            }
+            return [payload] if list_returning else payload
+    return wrapper
+
+
+# ─── access-token cache ────────────────────────────────────────────────────
+
+# Per-sender cache so multiple users share the process without trampling
+# each other's access tokens. The lock guards refresh races within one
+# sender; different senders refresh independently.
+_token_lock = threading.Lock()
+_access_tokens: dict[str, tuple[str, float]] = {}
+
+
+def _refresh_access_token(sender_id: str) -> str:
+    """Exchange this sender's refresh_token for a fresh access_token.
+    MYOB rotates the refresh_token on every call — persist the new one
+    under the same sender_id."""
     _require_creds()
-    rt = _load_refresh_token()
-    if not rt:
-        raise RuntimeError(
-            "No MYOB refresh token available. Provision one via "
-            "`sudo agenthq-cred set myob_refresh_token` (see tools/myob/setup.md)."
-        )
+    rt = _resolve_refresh_token(sender_id)
     r = requests.post(
-        OAUTH_URL,
+        OAUTH_TOKEN_URL,
         data={
             "client_id": CLIENT_ID,
             "client_secret": CLIENT_SECRET,
@@ -146,62 +332,62 @@ def _refresh_access_token() -> str:
         timeout=15,
     )
     if r.status_code != 200:
-        raise RuntimeError(
-            f"MYOB token refresh failed ({r.status_code}): {r.text[:300]}. "
-            "If this says invalid_grant, the refresh token has been revoked "
-            "(another client used it, or the user changed password) — re-run "
-            "the OAuth re-consent recipe in tools/myob/setup.md."
-        )
+        body = r.text[:300] if r.text else ""
+        # invalid_grant means the refresh_token chain has been broken
+        # (another client used it, or the user revoked). For per-user
+        # mode, the cleanest recovery is to ditch the user's token and
+        # re-prompt the auth dance on the next call.
+        if "invalid_grant" in body and sender_id != ADMIN_SENDER:
+            try:
+                _user_token_path(sender_id).unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise AuthRequired(sender_id) from None
+        raise RuntimeError(f"MYOB token refresh failed ({r.status_code}): {body}")
     payload = r.json()
     access = payload["access_token"]
     new_rt = payload.get("refresh_token")
     if new_rt and new_rt != rt:
-        _save_refresh_token(new_rt)
+        _save_resolved_refresh_token(sender_id, new_rt)
     return access
 
 
-def _access_token() -> str:
-    global _cached_access_token, _cached_access_token_expires_at
+def _access_token(sender_id: str) -> str:
     with _token_lock:
+        cached = _access_tokens.get(sender_id)
         now = time.time()
-        if _cached_access_token and now < _cached_access_token_expires_at:
-            return _cached_access_token
-        token = _refresh_access_token()
-        _cached_access_token = token
-        _cached_access_token_expires_at = now + ACCESS_TOKEN_TTL_SECONDS
+        if cached and now < cached[1]:
+            return cached[0]
+        token = _refresh_access_token(sender_id)
+        _access_tokens[sender_id] = (token, now + ACCESS_TOKEN_TTL_SECONDS)
         return token
 
 
-# ─── HTTP helpers ───────────────────────────────────────────────────────────
+# ─── HTTP helpers ──────────────────────────────────────────────────────────
 
-def _headers() -> dict[str, str]:
+def _headers(sender_id: str) -> dict[str, str]:
     return {
-        "Authorization": f"Bearer {_access_token()}",
+        "Authorization": f"Bearer {_access_token(sender_id)}",
         "x-myobapi-key": CLIENT_ID,
         "x-myobapi-version": "v2",
         "Accept": "application/json",
     }
 
 
-def _get(path: str, params: dict[str, Any] | None = None) -> Any:
-    """GET against the company-file root. `path` is appended to
-    /accountright/<business_id>, so callers pass e.g. "/Contact/Employee"."""
+def _get(path: str, sender_id: str, params: dict[str, Any] | None = None) -> Any:
+    """GET against the company-file root, on behalf of `sender_id`."""
     _require_creds()
     if not path.startswith("/"):
         path = "/" + path
     url = f"{COMPANY_FILE_BASE}{path}"
-    r = requests.get(url, headers=_headers(), params=params, timeout=30)
+    r = requests.get(url, headers=_headers(sender_id), params=params, timeout=30)
     if r.status_code == 401:
-        # Stale access token (clock skew, MYOB invalidated early). Force a
-        # refresh and retry once before failing the call.
-        global _cached_access_token_expires_at
-        _cached_access_token_expires_at = 0.0
-        r = requests.get(url, headers=_headers(), params=params, timeout=30)
+        # Stale cached access token — invalidate this sender's cache and
+        # retry once before giving up.
+        with _token_lock:
+            _access_tokens.pop(sender_id, None)
+        r = requests.get(url, headers=_headers(sender_id), params=params, timeout=30)
     if not r.ok:
-        # Surface MYOB's error envelope into the message so the agent (and
-        # future-Claude debugging this) sees what actually failed instead of
-        # a bare "400 Client Error". MYOB returns JSON like
-        # {"Errors":[{"Message":"...","AdditionalDetails":"..."}]}.
         body = r.text[:500] if r.text else ""
         raise RuntimeError(f"MYOB GET {path} failed ({r.status_code}): {body}")
     if not r.content:
@@ -209,34 +395,159 @@ def _get(path: str, params: dict[str, Any] | None = None) -> Any:
     return r.json()
 
 
+def _resolve_sender(sender_id: str) -> str:
+    """Validate sender_id. Required — the LLM must extract chat_id from the
+    Telegram channel tag and pass it. Direct/admin callers pass "_admin"
+    explicitly for the legacy single-account fallback."""
+    if not sender_id:
+        raise ValueError(
+            "sender_id is required. Extract it from the Telegram channel "
+            "tag in the user's message: <channel ... chat_id=\"X\" ...>. "
+            "Pass that chat_id as sender_id. For direct/admin invocations, "
+            "pass sender_id=\"_admin\"."
+        )
+    return _sanitize_id(sender_id)
+
+
 # ─── MCP server ─────────────────────────────────────────────────────────────
 
 mcp = FastMCP(
     "myob",
     instructions=(
-        "MYOB AccountRight Live access (read-only). Tools cover the chart of "
-        "accounts, profit & loss reports, and employee payroll details "
-        "including leave entitlements. All data comes from a single company "
-        "file configured by the operator. Do NOT attempt write operations — "
-        "this app registration is read-only by design."
+        "MYOB AccountRight Live access (read-only). Per-user authentication: "
+        "every tool call must include `sender_id`, the chat_id from the "
+        "Telegram channel tag of the message that prompted the request "
+        "(<channel source=\"telegram\" chat_id=\"...\" ...>). Each user "
+        "authorizes their own MYOB account once; subsequent calls return "
+        "only data scoped to their MYOB account.\n\n"
+        "If a tool returns {\"auth_required\": true, ...}, relay the "
+        "`message` field to the user via Telegram and stop. The user will "
+        "click the link, sign in, hit a 'site can't be reached' page on "
+        "localhost, and message the URL from their address bar back. When "
+        "they do, call myob_complete_auth(redirect_url, sender_id), then "
+        "retry the original request."
     ),
 )
 
 
-# ─── company file metadata ──────────────────────────────────────────────────
+# ─── auth-dance tools ──────────────────────────────────────────────────────
 
 @mcp.tool()
-def myob_company_file_info() -> dict:
+def myob_complete_auth(redirect_url: str, sender_id: str) -> dict:
+    """Second leg of the per-user OAuth dance — call after the user pastes
+    back the URL their browser ended on after signing in to MYOB.
+
+    Args:
+        redirect_url: The full URL the user copied from their browser's
+            address bar (e.g. 'http://localhost/?code=...&state=...').
+            A bare `code` value is also accepted if the user was unable
+            to copy the whole URL.
+        sender_id: Telegram chat_id of the user being authorized — must
+            match the chat_id the original auth request was issued for.
+            Pulled from the channel tag.
+
+    Returns {linked: true, message: "..."} on success, or
+    {auth_required: true, ...} if the link expired and they need to start over.
+    """
+    if not sender_id:
+        return {"error": "sender_id is required"}
+    sender_id = _sanitize_id(sender_id)
+
+    # Extract code + state. Accept either a full URL or a bare code.
+    code: str | None = None
+    state: str | None = None
+    if redirect_url and (redirect_url.startswith("http://") or redirect_url.startswith("https://")):
+        from urllib.parse import urlparse, parse_qs
+        try:
+            qs = parse_qs(urlparse(redirect_url).query)
+            code = (qs.get("code") or [None])[0]
+            state = (qs.get("state") or [None])[0]
+        except Exception:
+            return {"error": "Could not parse the URL — make sure you copied the entire address from the browser bar."}
+    else:
+        code = (redirect_url or "").strip() or None
+
+    if not code:
+        return {"error": "No `code` parameter found. Did you copy the URL from the failed-redirect page (the one starting with http://localhost/?code=…)?"}
+
+    # State validation: bind this redirect URL back to the sender it was
+    # issued for. If state is missing or doesn't match, refuse — that's
+    # either an expired/already-used link, or someone pasting a URL that
+    # was meant for a different user.
+    if state:
+        bound_sender = _consume_pending_state(state)
+        if bound_sender is None:
+            return {"error": "That sign-in link has expired or was already used. Ask your question again to get a fresh one."}
+        if bound_sender != sender_id:
+            return {"error": "That sign-in link belongs to a different user — start a new one by asking your question again."}
+
+    # Exchange code → tokens.
+    _require_creds()
+    r = requests.post(
+        OAUTH_TOKEN_URL,
+        data={
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "redirect_uri": OAUTH_REDIRECT_URI,
+            "code": code,
+            "grant_type": "authorization_code",
+        },
+        timeout=15,
+    )
+    if not r.ok:
+        return {"error": f"Token exchange failed ({r.status_code}): {r.text[:200]}"}
+    payload = r.json()
+    refresh_token = payload.get("refresh_token")
+    if not refresh_token:
+        return {"error": "MYOB did not return a refresh_token — make sure the requested scope includes offline_access (it should be set automatically)."}
+    _save_user_token(sender_id, refresh_token)
+    return {
+        "linked": True,
+        "message": "Authorized. You can now ask MYOB questions.",
+    }
+
+
+@mcp.tool()
+def myob_who_am_i(sender_id: str) -> dict:
+    """Diagnostic: report whether the calling sender has linked their
+    MYOB account, and (if so) when. Helpful for users who can't tell
+    whether their auth went through."""
+    sender_id = _resolve_sender(sender_id)
+    if sender_id == ADMIN_SENDER:
+        return {
+            "sender_id": "_admin",
+            "linked": bool(SEED_REFRESH_TOKEN) or LEGACY_REFRESH_TOKEN_FILE.exists(),
+            "mode": "admin/single-account",
+        }
+    p = _user_token_path(sender_id)
+    if not p.exists():
+        return {"sender_id": sender_id, "linked": False, "mode": "per-user"}
+    try:
+        data = json.loads(p.read_text())
+        return {
+            "sender_id": sender_id,
+            "linked": True,
+            "mode": "per-user",
+            "linked_at": data.get("linked_at"),
+            "updated_at": data.get("updated_at"),
+        }
+    except Exception:
+        return {"sender_id": sender_id, "linked": True, "mode": "per-user"}
+
+
+# ─── company file metadata ─────────────────────────────────────────────────
+
+@mcp.tool()
+@requires_auth
+def myob_company_file_info(sender_id: str) -> dict:
     """Return company file metadata (name, AccountRight product/version,
     last sync time, country, currency). Useful as a connectivity sanity
     check before running larger queries."""
-    return _get("/")
+    return _get("/", _resolve_sender(sender_id))
 
 
-# ─── general ledger ─────────────────────────────────────────────────────────
+# ─── general ledger ────────────────────────────────────────────────────────
 
-# Restrict to MYOB's documented Classification values so a typo in the
-# argument fails clearly here rather than as an opaque MYOB filter error.
 ACCOUNT_CLASSIFICATIONS = {
     "Asset", "Liability", "Equity", "Income", "Expense",
     "CostOfSales", "OtherIncome", "OtherExpense",
@@ -244,10 +555,13 @@ ACCOUNT_CLASSIFICATIONS = {
 
 
 @mcp.tool()
+@requires_auth
 def myob_accounts(
     class_filter: str | None = None,
     account_number_prefix: str | None = None,
     limit: int = 500,
+    *,
+    sender_id: str,
 ) -> list[dict]:
     """List the chart of accounts.
 
@@ -258,6 +572,7 @@ def myob_accounts(
             with this string (e.g. "4-" for income accounts in many setups).
         limit: Max accounts to return (default 500, MYOB's hard cap is 1000).
     """
+    sender = _resolve_sender(sender_id)
     params: dict[str, Any] = {"$top": min(max(limit, 1), 1000)}
     filters: list[str] = []
     if class_filter:
@@ -267,14 +582,10 @@ def myob_accounts(
                 f"got {class_filter!r}"
             )
         filters.append(f"Classification eq '{class_filter}'")
-    if account_number_prefix:
-        # MYOB's $filter doesn't support startswith on DisplayID reliably —
-        # do prefix matching client-side so we don't trip InefficientFilter.
-        pass
     if filters:
         params["$filter"] = " and ".join(filters)
 
-    data = _get("/GeneralLedger/Account", params=params)
+    data = _get("/GeneralLedger/Account", sender, params=params)
     items = data.get("Items", []) if isinstance(data, dict) else []
     if account_number_prefix:
         items = [a for a in items if (a.get("DisplayID") or "").startswith(account_number_prefix)]
@@ -295,20 +606,17 @@ def myob_accounts(
     ]
 
 
-# ─── reports ────────────────────────────────────────────────────────────────
+# ─── reports ───────────────────────────────────────────────────────────────
 
 REPORTING_BASES = {"Accrual", "Cash"}
 
 
-def _pl_call(start_date: str, end_date: str, basis: str) -> dict:
+def _pl_call(start_date: str, end_date: str, basis: str, sender_id: str) -> dict:
     if basis not in REPORTING_BASES:
         raise ValueError(f"basis must be 'Accrual' or 'Cash', got {basis!r}")
-    # MYOB requires YearEndAdjust on the P&L endpoint as of late 2025.
-    # `false` matches what the AccountRight UI uses by default — only flip
-    # to `true` if you want the report to include year-end posting
-    # adjustments (typically only relevant for the closing month of FY).
     return _get(
         "/Report/ProfitAndLossSummary",
+        sender_id,
         params={
             "startDate": start_date,
             "endDate": end_date,
@@ -319,10 +627,13 @@ def _pl_call(start_date: str, end_date: str, basis: str) -> dict:
 
 
 @mcp.tool()
+@requires_auth
 def myob_pl_summary(
     start_date: str,
     end_date: str,
     basis: str = "Accrual",
+    *,
+    sender_id: str,
 ) -> dict:
     """Profit & Loss summary report for one date range.
 
@@ -330,38 +641,31 @@ def myob_pl_summary(
         start_date: ISO date 'YYYY-MM-DD' (inclusive).
         end_date: ISO date 'YYYY-MM-DD' (inclusive).
         basis: 'Accrual' (default) or 'Cash'.
-
-    Returns the full MYOB report payload — header info plus an array of
-    line items grouped by classification (Income, Expense, etc.).
     """
-    return _pl_call(start_date, end_date, basis)
+    return _pl_call(start_date, end_date, basis, _resolve_sender(sender_id))
 
 
 @mcp.tool()
+@requires_auth
 def myob_pl_compare(
     periods_json: str,
     basis: str = "Accrual",
+    *,
+    sender_id: str,
 ) -> list[dict]:
     """Run P&L summary across multiple periods and return them side-by-side.
 
     Args:
         periods_json: JSON array of {label, start_date, end_date} objects.
-            Example:
-              [
-                {"label": "FY24", "start_date": "2023-07-01", "end_date": "2024-06-30"},
-                {"label": "FY25 to date", "start_date": "2024-07-01", "end_date": "2025-04-30"}
-              ]
         basis: 'Accrual' (default) or 'Cash' — applied to every period.
-
-    Each output element is {label, start_date, end_date, report}.
     """
+    sender = _resolve_sender(sender_id)
     try:
         periods = json.loads(periods_json)
     except json.JSONDecodeError as e:
         raise ValueError(f"periods_json is not valid JSON: {e}") from e
     if not isinstance(periods, list) or not periods:
         raise ValueError("periods_json must be a non-empty JSON array")
-
     out: list[dict] = []
     for p in periods:
         start = p.get("start_date")
@@ -369,29 +673,22 @@ def myob_pl_compare(
         label = p.get("label") or f"{start}..{end}"
         if not (start and end):
             raise ValueError(f"period missing start_date/end_date: {p!r}")
-        out.append(
-            {
-                "label": label,
-                "start_date": start,
-                "end_date": end,
-                "report": _pl_call(start, end, basis),
-            }
-        )
+        out.append({
+            "label": label,
+            "start_date": start,
+            "end_date": end,
+            "report": _pl_call(start, end, basis, sender),
+        })
     return out
 
 
-# ─── employees / payroll ────────────────────────────────────────────────────
+# ─── employees / payroll ───────────────────────────────────────────────────
 
-# MYOB OData rejects identifiers containing single quotes inside string
-# literals unless we double them. Names with apostrophes (e.g. O'Brien)
-# would otherwise produce a 400 with a confusing parse-error message.
 def _odata_str(value: str) -> str:
     return value.replace("'", "''")
 
 
 def _summarize_employee(emp: dict) -> dict:
-    # MYOB returns a deeply nested record; flatten to the bits the LLM needs
-    # to act, with a pointer to the full record's UID for drill-down.
     payroll = emp.get("EmployeePayrollDetails") or {}
     return {
         "uid": emp.get("UID"),
@@ -406,75 +703,63 @@ def _summarize_employee(emp: dict) -> dict:
 
 
 @mcp.tool()
+@requires_auth
 def myob_employee_lookup(
     first_name: str | None = None,
     last_name: str | None = None,
+    *,
+    sender_id: str,
 ) -> list[dict]:
-    """Find employees whose first or last name matches (exact, case-sensitive).
+    """Find employees whose first or last name exactly matches (case-sensitive).
 
-    Args:
-        first_name: Match on FirstName. Combined with last_name via OR.
-        last_name: Match on LastName.
-
-    At least one of first_name / last_name is required. MYOB's $filter
-    only supports `eq` / `ne` (not `contains`) — pass exact strings.
-    Returns a list of compact employee summaries each with a UID for
-    further drill-down via myob_employee_payroll_details.
+    MYOB's $filter only supports `eq` / `ne`, not `contains` — pass
+    exact strings. For partial matches use myob_employee_leave_balance
+    (which has a fuzzy fallback).
     """
+    sender = _resolve_sender(sender_id)
     if not (first_name or last_name):
         raise ValueError("Provide at least one of first_name or last_name.")
-
     clauses: list[str] = []
     if first_name:
         clauses.append(f"FirstName eq '{_odata_str(first_name)}'")
     if last_name:
         clauses.append(f"LastName eq '{_odata_str(last_name)}'")
     params = {"$filter": " or ".join(clauses)}
-    data = _get("/Contact/Employee", params=params)
+    data = _get("/Contact/Employee", sender, params=params)
     items = data.get("Items", []) if isinstance(data, dict) else []
     return [_summarize_employee(e) for e in items]
 
 
 @mcp.tool()
-def myob_employee_payroll_details(uid: str) -> dict:
+@requires_auth
+def myob_employee_payroll_details(uid: str, sender_id: str) -> dict:
     """Full payroll record for one employee by UID.
 
     Returns AnnualSalary, HourlyRate, PayFrequency, HoursInWeeklyPayPeriod,
     StartDate, WageCategories, Superannuation, Tax, and the full
     Entitlements array (leave balances).
-
-    Get the UID from myob_employee_lookup. The UID for the payroll record
-    is the same as the EmployeePayrollDetails.UID value returned there.
     """
     if not uid:
         raise ValueError("uid is required")
-    return _get(f"/Contact/EmployeePayrollDetails/{uid}")
+    return _get(f"/Contact/EmployeePayrollDetails/{uid}", _resolve_sender(sender_id))
 
 
 @mcp.tool()
-def myob_employee_standard_pay(uid: str) -> dict:
-    """Standard (recurring) pay configuration for one employee by UID.
-
-    This is the template MYOB applies each pay run before adjustments —
-    useful for confirming someone's expected fortnightly pay or which
-    wage/entitlement/super categories accrue automatically.
-    """
+@requires_auth
+def myob_employee_standard_pay(uid: str, sender_id: str) -> dict:
+    """Standard (recurring) pay configuration for one employee by UID."""
     if not uid:
         raise ValueError("uid is required")
-    return _get(f"/Contact/EmployeeStandardPay/{uid}")
+    return _get(f"/Contact/EmployeeStandardPay/{uid}", _resolve_sender(sender_id))
 
 
-# Hours per workday for converting leave hours → days. MYOB doesn't expose
-# this on the entitlement record so we infer from Wage.HoursInWeeklyPayPeriod
-# combined with PayFrequency. The field name is misleading: for Fortnightly
-# employees it's actually hours over a fortnight (80 = 8h × 10 working days),
-# not over a single week. Always divide by working-days-in-period.
+# Working days per pay period for hours→days conversion.
 PERIOD_WORKING_DAYS = {
     "Weekly": 5,
     "Fortnightly": 10,
-    "Monthly": 22,           # standard payroll convention: 22 working days/mo
-    "Bimonthly": 11,         # twice per month — half a month of working days
-    "Quarterly": 65,         # ~22 × 3
+    "Monthly": 22,
+    "Bimonthly": 11,
+    "Quarterly": 65,
 }
 
 
@@ -485,39 +770,32 @@ def _hours_per_day(payroll: dict) -> float:
     days = PERIOD_WORKING_DAYS.get(pay_freq, 5)
     if isinstance(period_hours, (int, float)) and period_hours > 0 and days > 0:
         return float(period_hours) / float(days)
-    # Fall back to Australia's notional 38h week / 5 days = 7.6h/day.
     return 7.6
 
 
 @mcp.tool()
-def myob_employee_leave_balance(name: str) -> dict:
-    """Convenience: look up an employee by name, then return only their
-    assigned leave entitlements (sick, holiday, long-service, etc.) with
-    hours and an estimated days-equivalent.
+@requires_auth
+def myob_employee_leave_balance(name: str, sender_id: str) -> dict:
+    """Convenience: look up an employee by name, return only their assigned
+    leave entitlements with hours and an estimated days-equivalent.
 
     Args:
-        name: First or last name. Tries last name first, then first name.
-
-    Returns {employee, hours_per_day, entitlements: [{name, type, hours, days, ...}]}
+        name: First or last name (or part). Falls back to a substring scan
+            across all active employees if no exact match is found —
+            useful when the actual LastName has multiple words.
     """
+    sender = _resolve_sender(sender_id)
     if not name or not name.strip():
         raise ValueError("name is required")
     needle = name.strip()
 
-    # Try fast OData exact-match queries first (cheap, indexed). Last name
-    # is more selective in most orgs, then first name.
-    matches = myob_employee_lookup(last_name=needle)
+    matches = myob_employee_lookup(last_name=needle, sender_id=sender_id)
     if not matches:
-        matches = myob_employee_lookup(first_name=needle)
-
-    # Fallback: MYOB OData has no contains() / startswith() that we can rely
-    # on, so a name like "Saraiva" never matches LastName="Dos Santos
-    # Saraiva". Fetch the full active-employee list (small enough — most
-    # AccountRight files have <500 employees) and substring-match
-    # case-insensitively against First/Last/DisplayID.
+        matches = myob_employee_lookup(first_name=needle, sender_id=sender_id)
     if not matches:
+        # Fuzzy: full-list substring match.
         try:
-            data = _get("/Contact/Employee", params={"$top": 1000})
+            data = _get("/Contact/Employee", sender, params={"$top": 1000})
             all_emps = data.get("Items", []) if isinstance(data, dict) else []
         except Exception:
             all_emps = []
@@ -548,7 +826,7 @@ def myob_employee_leave_balance(name: str) -> dict:
 
     emp = matches[0]
     payroll_uid = emp.get("payroll_details_uid") or emp.get("uid")
-    payroll = _get(f"/Contact/EmployeePayrollDetails/{payroll_uid}")
+    payroll = _get(f"/Contact/EmployeePayrollDetails/{payroll_uid}", sender)
 
     hpd = _hours_per_day(payroll)
     raw_entitlements = payroll.get("Entitlements") or []
@@ -561,19 +839,15 @@ def myob_employee_leave_balance(name: str) -> dict:
         total = ent.get("Total")
         if total is None:
             total = (carry or 0.0) + (ytd or 0.0)
-        # MYOB nests the category under "EntitlementCategory" on entitlement
-        # records (not "PayrollCategory" — that's the wage-record key).
         cat = ent.get("EntitlementCategory") or ent.get("PayrollCategory") or {}
-        assigned.append(
-            {
-                "name": cat.get("Name"),
-                "uid": cat.get("UID"),
-                "carry_over_hours": carry,
-                "year_to_date_hours": ytd,
-                "total_hours": total,
-                "days_equivalent": round(total / hpd, 2) if hpd else None,
-            }
-        )
+        assigned.append({
+            "name": cat.get("Name"),
+            "uid": cat.get("UID"),
+            "carry_over_hours": carry,
+            "year_to_date_hours": ytd,
+            "total_hours": total,
+            "days_equivalent": round(total / hpd, 2) if hpd else None,
+        })
 
     return {
         "employee": {
@@ -587,16 +861,13 @@ def myob_employee_leave_balance(name: str) -> dict:
     }
 
 
-# ─── payroll category catalogues ────────────────────────────────────────────
+# ─── payroll category catalogues ───────────────────────────────────────────
 
 @mcp.tool()
-def myob_wage_categories() -> list[dict]:
-    """List wage payroll categories (ordinary time, overtime, allowances, etc.).
-
-    Use the returned UIDs to interpret the WageCategories arrays returned by
-    myob_employee_payroll_details / myob_employee_standard_pay.
-    """
-    data = _get("/Payroll/PayrollCategory/Wage")
+@requires_auth
+def myob_wage_categories(sender_id: str) -> list[dict]:
+    """List wage payroll categories (ordinary time, overtime, allowances)."""
+    data = _get("/Payroll/PayrollCategory/Wage", _resolve_sender(sender_id))
     items = data.get("Items", []) if isinstance(data, dict) else []
     return [
         {
@@ -611,13 +882,10 @@ def myob_wage_categories() -> list[dict]:
 
 
 @mcp.tool()
-def myob_entitlement_categories() -> list[dict]:
-    """List entitlement payroll categories (sick, holiday, long-service, etc.).
-
-    Use the returned UIDs to interpret the Entitlements arrays returned by
-    myob_employee_payroll_details / myob_employee_leave_balance.
-    """
-    data = _get("/Payroll/PayrollCategory/Entitlement")
+@requires_auth
+def myob_entitlement_categories(sender_id: str) -> list[dict]:
+    """List entitlement payroll categories (sick, holiday, long-service)."""
+    data = _get("/Payroll/PayrollCategory/Entitlement", _resolve_sender(sender_id))
     items = data.get("Items", []) if isinstance(data, dict) else []
     return [
         {
@@ -630,15 +898,20 @@ def myob_entitlement_categories() -> list[dict]:
     ]
 
 
-# ─── escape hatch ───────────────────────────────────────────────────────────
+# ─── escape hatch ──────────────────────────────────────────────────────────
 
 @mcp.tool()
-def myob_raw_get(path: str, params_json: str | None = None) -> Any:
+@requires_auth
+def myob_raw_get(
+    path: str,
+    params_json: str | None = None,
+    *,
+    sender_id: str,
+) -> Any:
     """GET an arbitrary AccountRight company-file path.
 
     Use only for endpoints not covered by the typed tools above. `path` is
-    relative to the company file root (e.g. '/Sale/Invoice', '/Contact/Customer').
-    `params_json` is an optional JSON object of query-string parameters.
+    relative to the company file root.
     """
     if not path:
         raise ValueError("path is required")
@@ -650,10 +923,10 @@ def myob_raw_get(path: str, params_json: str | None = None) -> Any:
             raise ValueError(f"params_json is not valid JSON: {e}") from e
         if not isinstance(params, dict):
             raise ValueError("params_json must encode a JSON object")
-    return _get(path, params=params)
+    return _get(path, _resolve_sender(sender_id), params=params)
 
 
-# ─── entry ──────────────────────────────────────────────────────────────────
+# ─── entry ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     mcp.run()
