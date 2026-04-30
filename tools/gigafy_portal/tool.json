@@ -1,0 +1,38 @@
+{
+  "name": "gigafy_portal",
+  "title": "Gigafy Management Portal",
+  "description": "Read-only access to manage.gigafy.com.au via the Hotspot Login Services API. Sales orders, quotes, BOM lookups. Single shared service-account auth (transitional — Cameron's per-user OAuth + delegation will replace this).",
+  "credentials": [
+    {
+      "key": "portal_api_user",
+      "label": "Service account username",
+      "env": "PORTAL_API_USER",
+      "description": "Username of the dedicated service account that AgentHQ uses to query the Portal."
+    },
+    {
+      "key": "portal_api_pass",
+      "label": "Service account password",
+      "env": "PORTAL_API_PASS",
+      "secret": true,
+      "description": "Encrypted at rest in the systemd-creds vault. Never visible to the LLM or to the agent user — only the trusted -mcp peer can decrypt it. Rotate via `sudo agenthq-cred set portal_api_pass`."
+    },
+    {
+      "key": "portal_reseller_id",
+      "label": "Reseller GUID",
+      "env": "PORTAL_RESELLER_ID",
+      "description": "Gigafy's reseller GUID — used as a path segment in the Sales Orders search endpoint."
+    },
+    {
+      "key": "portal_api_url",
+      "label": "API URL",
+      "env": "PORTAL_API_URL",
+      "optional": true,
+      "description": "Defaults to https://au.api.hotspotlogin.services. Override only if you're pointing at a staging environment."
+    }
+  ],
+  "tools": {
+    "gigafy_portal_ping": {
+      "description": "Connectivity sanity check — mints a fresh access token and reports who we authenticated as"
+    }
+  }
+}
