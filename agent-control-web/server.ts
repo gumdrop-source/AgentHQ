@@ -942,15 +942,16 @@ app.get("/integrations/:id/activate", (c) => {
     const oauth = m.oauth as OAuthManifest | undefined;
     const discoveryTarget = oauth ? discoveryTargetField(oauth, m) : undefined;
     const credFields = (m.credentials ?? []).map((cred: any) => {
-        // Refresh-token + discovery-target fields are JS-populated by the
-        // OAuth helper, so we render them as hidden inputs the operator
-        // never sees. They still post on submit. The discovery-target
-        // wrapper carries data-cred so the JS can re-surface it as a
-        // visible input if discovery returns zero options.
-        const isAutoFilled = !!oauth && (
-            cred.key === oauth.refresh_token_field ||
-            (!!discoveryTarget && cred.key === discoveryTarget)
-        );
+        // Hidden creds: never rendered, never posted. Used for things
+        // operators shouldn't have to think about during activation
+        // (e.g. myob_refresh_token, which is per-user and onboarded
+        // through Telegram, not the wizard).
+        if (cred.hidden) return "";
+        // Auto-filled creds: discovery-target fields rendered as
+        // type=hidden so the OAuth helper can populate them silently.
+        // They still post on submit. The wrapper carries data-cred so
+        // the JS can re-surface them if discovery returns zero options.
+        const isAutoFilled = !!oauth && !!discoveryTarget && cred.key === discoveryTarget;
         if (isAutoFilled) {
             return `
         <div data-cred="${escapeHtml(cred.key)}" class="hidden">
@@ -1138,6 +1139,9 @@ app.post("/integrations/:id/activate", async (c) => {
     const errors: string[] = [];
 
     for (const cred of (m.credentials ?? [])) {
+        // Hidden creds are never surfaced in the form, so they're never
+        // posted. Skip them entirely — admins set hidden creds via CLI.
+        if (cred.hidden) continue;
         const value = String(body[cred.key] ?? "").trim();
         if (!value) {
             // Skip empty optional creds — they're nice-to-have, not required.

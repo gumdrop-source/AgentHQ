@@ -24,11 +24,12 @@
     },
     {
       "key": "myob_refresh_token",
-      "label": "Admin Refresh Token (optional)",
+      "label": "Admin Refresh Token",
       "env": "MYOB_REFRESH_TOKEN",
       "secret": true,
       "optional": true,
-      "description": "Optional — leave blank in per-user mode. Each Telegram user runs their own sign-in dance the first time they ask MYOB anything. Set this only if you want a platform-wide admin token used for direct/CLI access (the test harness uses it)."
+      "hidden": true,
+      "description": "Not surfaced in the wizard. Each Telegram user runs their own sign-in dance the first time they ask the bot anything MYOB-related — no platform-level token needed. Admins who want a platform token for direct/CLI use can set it via `sudo agenthq-cred set myob_refresh_token`."
     }
   ],
   "oauth": {
