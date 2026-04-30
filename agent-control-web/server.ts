@@ -512,6 +512,10 @@ async function writeSystemdDropIn(agentName: string): Promise<void> {
         for (const cred of (manifest.credentials ?? [])) {
             const key = cred.key;
             if (!/^[a-zA-Z0-9_-]+$/.test(key)) continue;
+            // Optional creds: only emit a LoadCredentialEncrypted line if
+            // the operator actually provided a value. Otherwise systemd
+            // would refuse to start the unit on the missing .cred file.
+            if (cred.optional && !existsSync(`/etc/agents/credentials/${key}.cred`)) continue;
             mcpLines.push(`LoadCredentialEncrypted=${key}:/etc/agents/credentials/${key}.cred`);
         }
     }
@@ -956,10 +960,11 @@ app.get("/integrations/:id/activate", (c) => {
         </div>
     `;
         }
+        const isOptional = !!cred.optional;
         return `
         <div data-cred="${escapeHtml(cred.key)}">
-          <label class="block text-sm font-medium mb-1">${escapeHtml(cred.label ?? cred.key)}${cred.secret ? " <span class='text-xs text-slate-400 font-normal'>(secret)</span>" : ""}</label>
-          <input id="cred-${escapeHtml(cred.key)}" name="${escapeHtml(cred.key)}" required
+          <label class="block text-sm font-medium mb-1">${escapeHtml(cred.label ?? cred.key)}${cred.secret ? " <span class='text-xs text-slate-400 font-normal'>(secret)</span>" : ""}${isOptional ? " <span class='text-xs text-slate-400 font-normal'>(optional)</span>" : ""}</label>
+          <input id="cred-${escapeHtml(cred.key)}" name="${escapeHtml(cred.key)}"${isOptional ? "" : " required"}
                  ${cred.secret ? 'type="password" autocomplete="new-password"' : 'type="text" autocomplete="off"'}
                  spellcheck="false" autocapitalize="off" autocorrect="off"
                  data-1p-ignore data-lpignore="true" data-bwignore="true"
@@ -1135,6 +1140,9 @@ app.post("/integrations/:id/activate", async (c) => {
     for (const cred of (m.credentials ?? [])) {
         const value = String(body[cred.key] ?? "").trim();
         if (!value) {
+            // Skip empty optional creds — they're nice-to-have, not required.
+            // Required missing creds still surface as errors below.
+            if (cred.optional) continue;
             errors.push(`Missing value for ${cred.key}`);
             continue;
         }
