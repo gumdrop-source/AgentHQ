@@ -67,7 +67,10 @@
       "destructive": true
     },
     "gigafy_portal_ledger_for_account": {
-      "description": "Ledger entries for one chart-of-accounts account over a date range — answers 'how much have we spent on X'"
+      "description": "Ledger entries for one chart-of-accounts account over a date range — optional journal_filter (PJ/SJ/GJ/...) for purchase-only / sales-only views"
+    },
+    "gigafy_portal_ledger_for_accounts": {
+      "description": "Multi-account ledger roll-up — fan out across a list of GUIDs, return combined entries plus per-account totals"
     }
   }
 }

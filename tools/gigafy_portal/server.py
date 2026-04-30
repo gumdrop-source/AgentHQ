@@ -657,6 +657,7 @@ def gigafy_portal_ledger_for_account(
     coa_entity_id: str,
     date_from: str,
     date_to: str,
+    journal_filter: str | None = None,
 ) -> Any:
     """Pull the accounting ledger for one chart-of-accounts account
     over a date range. Use to answer questions like "list all
@@ -681,10 +682,15 @@ def gigafy_portal_ledger_for_account(
         date_from: ISO date 'YYYY-MM-DD' (inclusive). Tool converts
             to epoch-ms internally.
         date_to: ISO date 'YYYY-MM-DD' (inclusive).
+        journal_filter: Optional — restrict to one journal type. Common
+            values: "PJ" (purchase invoices), "SJ" (sales invoices),
+            "GJ" (general journal adjustments), "CRJ" (cash receipts),
+            "CDJ" (cash disbursements). The API doesn't accept this as
+            a query param, so the filter is applied client-side after
+            the GET. Default None returns all journal types.
 
-    For multi-account roll-ups (e.g. "marketing" spans Advertising +
-    Sponsorships + Trade Shows), call this once per coaEntityId and
-    combine — the API doesn't accept multiple accounts in one call.
+    For multi-account roll-ups, use gigafy_portal_ledger_for_accounts
+    instead — it fans out across multiple coaEntityIds in one call.
     """
     if not coa_entity_id:
         raise ValueError("coa_entity_id is required")
@@ -692,9 +698,90 @@ def gigafy_portal_ledger_for_account(
     epoch_to = _to_epoch_ms(date_to)
     if epoch_to < epoch_from:
         raise ValueError("date_to must be on or after date_from")
-    return _get(
+    result = _get(
         f"/api/Resellers/{RESELLER_ID}/Ledger/{coa_entity_id}/{epoch_from}/{epoch_to}"
     )
+    if journal_filter and isinstance(result, dict) and isinstance(result.get("table"), list):
+        result["table"] = [r for r in result["table"] if (r.get("journal") or "") == journal_filter]
+    return result
+
+
+@mcp.tool()
+def gigafy_portal_ledger_for_accounts(
+    coa_entity_ids: list[str],
+    date_from: str,
+    date_to: str,
+    journal_filter: str | None = None,
+) -> dict:
+    """Multi-account ledger fan-out — pull the ledger for each of a list
+    of accounts in one call, returning combined rows.
+
+    Used for roll-ups where one logical category spans multiple Chart
+    of Accounts entries. For example "marketing" might match both
+    "6-0020 Advertising & Marketing" AND "6-3010 Wages - Marketing"
+    — you want the combined view, not two separate queries.
+
+    Args:
+        coa_entity_ids: List of account GUIDs. Get them from
+            gigafy_portal_account_lookup(query) and pick the ones
+            that belong in the roll-up.
+        date_from / date_to: ISO 'YYYY-MM-DD' bounds (inclusive).
+        journal_filter: Optional, same as ledger_for_account.
+
+    Returns:
+        {
+          "entries":         [<combined ledger rows>],
+          "by_account":      { "<coaEntityId>": { "code", "name",
+                                                  "rows", "total" } },
+          "grand_total":     <sum of dr - cr across all entries>,
+          "date_from":       "...",
+          "date_to":         "...",
+          "journal_filter":  "..." | null
+        }
+
+    Each row in `entries` retains its `code` field so the LLM can
+    re-group by account if needed. `by_account` is a pre-aggregated
+    summary keyed by GUID — contains the row count and net total per
+    account, ready to surface in a preview.
+    """
+    if not coa_entity_ids:
+        raise ValueError("coa_entity_ids is required (one or more GUIDs)")
+    epoch_from = _to_epoch_ms(date_from)
+    epoch_to = _to_epoch_ms(date_to)
+    if epoch_to < epoch_from:
+        raise ValueError("date_to must be on or after date_from")
+
+    combined: list[dict] = []
+    by_account: dict[str, dict] = {}
+    for eid in coa_entity_ids:
+        if not eid:
+            continue
+        led = _get(
+            f"/api/Resellers/{RESELLER_ID}/Ledger/{eid}/{epoch_from}/{epoch_to}"
+        )
+        rows = led.get("table", []) if isinstance(led, dict) else []
+        if journal_filter:
+            rows = [r for r in rows if (r.get("journal") or "") == journal_filter]
+        # Account name comes back on each ledger row as `description` for
+        # this account; pluck the first one we see.
+        first = rows[0] if rows else {}
+        by_account[eid] = {
+            "code": first.get("code"),
+            "name": first.get("description"),
+            "rows": len(rows),
+            "total": sum(float(r.get("dr") or 0) - float(r.get("cr") or 0) for r in rows),
+        }
+        combined.extend(rows)
+
+    grand_total = sum(v["total"] for v in by_account.values())
+    return {
+        "entries": combined,
+        "by_account": by_account,
+        "grand_total": grand_total,
+        "date_from": date_from,
+        "date_to": date_to,
+        "journal_filter": journal_filter,
+    }
 
 
 # ─── entry ─────────────────────────────────────────────────────────────────
