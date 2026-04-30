@@ -684,24 +684,222 @@ function loadManifest(id: string): any | null {
     try { return JSON.parse(readFileSync(path, "utf8")); } catch { return null; }
 }
 
+// ─── OAuth helper (manifest-driven activation flow) ───────────────────────
+//
+// When tool.json declares an `oauth` block, the activate page renders an
+// inline helper that walks the operator through the authorization-code
+// dance. The user enters their API Key + Secret in the form, the helper
+// builds the authorize URL on the fly, the user signs in to the upstream
+// provider in a new tab, the provider redirects to http://localhost
+// (which fails in the browser by design — that 404 page just lets the
+// user copy the `?code=…` URL out of the address bar), the user pastes
+// that URL back, and the wizard exchanges it server-side for the
+// refresh_token. Optional `discovery` hooks then auto-fill follow-up
+// fields (e.g. company file GUID) so the operator almost never has to
+// type anything beyond the API Key + Secret.
+type OAuthManifest = {
+    authorize_url: string;
+    token_url: string;
+    redirect_uri: string;
+    scope: string;
+    client_id_field: string;
+    client_secret_field: string;
+    refresh_token_field: string;
+    discovery?: string;
+};
+
+// Returns the credential key whose value will be auto-filled by the
+// discovery step. Tool-specific lookup; add a branch when wiring a new
+// OAuth tool that needs auto-discovery (e.g. xero tenant_id).
+function discoveryTargetField(oauth: OAuthManifest, m: any): string | undefined {
+    if (oauth.discovery === "myob_company_files") {
+        const cred = (m.credentials ?? []).find((c: any) => c.key === "myob_business_id");
+        return cred ? "myob_business_id" : undefined;
+    }
+    return undefined;
+}
+
+function renderOAuthHelper(id: string, oauth: OAuthManifest): string {
+    return `
+      <div class="rounded-xl border border-blue-200 bg-blue-50 p-4 space-y-3"
+           data-oauth-helper
+           data-oauth-id="${escapeHtml(id)}"
+           data-client-id-field="cred-${escapeHtml(oauth.client_id_field)}"
+           data-client-secret-field="cred-${escapeHtml(oauth.client_secret_field)}"
+           data-refresh-token-field="cred-${escapeHtml(oauth.refresh_token_field)}"
+           data-authorize-url="${escapeHtml(oauth.authorize_url)}"
+           data-redirect-uri="${escapeHtml(oauth.redirect_uri)}"
+           data-scope="${escapeHtml(oauth.scope)}"
+           data-discovery="${escapeHtml(oauth.discovery ?? "")}">
+        <div>
+          <h4 class="font-medium text-slate-900">Get a refresh token</h4>
+          <p class="text-xs text-slate-600 mt-1">The helper builds the authorize URL and runs the code-for-token exchange for you. Fill <strong>API Key</strong> and <strong>API Secret</strong> above first.</p>
+        </div>
+        <ol class="list-decimal list-inside text-sm text-slate-700 space-y-2">
+          <li>
+            <a href="#" data-oauth-authorize
+               class="pointer-events-none opacity-50 inline-flex items-center gap-1 px-3 py-1.5 rounded-lg font-medium text-sm bg-slate-900 text-white hover:bg-slate-700"
+               target="_blank" rel="noopener noreferrer">Authorize with provider →</a>
+            <span class="text-xs text-slate-500 ml-2" data-oauth-authorize-hint>(enter API Key first)</span>
+          </li>
+          <li>
+            Sign in &amp; approve. The browser will then try to load
+            <code class="px-1 rounded bg-white border border-slate-200 text-xs">${escapeHtml(oauth.redirect_uri)}/?code=…</code>
+            and show a "this site can't be reached" / "connection refused" error page.
+            <strong class="text-slate-900">That's expected</strong> — nothing is actually listening on that address. The browser address bar still contains the full redirect URL, which is what we need.
+          </li>
+          <li>
+            <strong>Copy the entire URL from the address bar</strong>
+            (click the address bar or press <kbd class="px-1 rounded bg-white border border-slate-200 text-xs">Ctrl</kbd>+<kbd class="px-1 rounded bg-white border border-slate-200 text-xs">L</kbd>, then <kbd class="px-1 rounded bg-white border border-slate-200 text-xs">Ctrl</kbd>+<kbd class="px-1 rounded bg-white border border-slate-200 text-xs">C</kbd>) and paste it below:
+          </li>
+        </ol>
+        <div class="flex gap-2">
+          <input data-oauth-redirect-input type="text" autocomplete="off" spellcheck="false"
+                 placeholder="${escapeHtml(oauth.redirect_uri)}/?code=..."
+                 class="flex-1 rounded-lg border border-slate-300 px-3 py-2 font-mono text-xs">
+          <button type="button" data-oauth-exchange
+                  class="px-3 py-2 rounded-lg font-medium text-sm bg-emerald-600 text-white hover:bg-emerald-500 disabled:opacity-50">
+            Get refresh token
+          </button>
+        </div>
+        <div data-oauth-status class="text-xs hidden"></div>
+      </div>
+      <script>
+      (function () {
+        const helper = document.querySelector('[data-oauth-helper][data-oauth-id="${escapeHtml(id)}"]');
+        if (!helper) return;
+        const id = helper.dataset.oauthId;
+        const clientIdInput     = document.getElementById(helper.dataset.clientIdField);
+        const clientSecretInput = document.getElementById(helper.dataset.clientSecretField);
+        const refreshInput      = document.getElementById(helper.dataset.refreshTokenField);
+        const authorizeBaseUrl  = helper.dataset.authorizeUrl;
+        const redirectUri       = helper.dataset.redirectUri;
+        const scope             = helper.dataset.scope;
+        const authorizeBtn      = helper.querySelector('[data-oauth-authorize]');
+        const authorizeHint     = helper.querySelector('[data-oauth-authorize-hint]');
+        const redirectInput     = helper.querySelector('[data-oauth-redirect-input]');
+        const exchangeBtn       = helper.querySelector('[data-oauth-exchange]');
+        const statusEl          = helper.querySelector('[data-oauth-status]');
+
+        function buildAuthorizeUrl() {
+          const cid = (clientIdInput && clientIdInput.value || '').trim();
+          if (!cid) return '';
+          const params = new URLSearchParams({
+            client_id: cid,
+            redirect_uri: redirectUri,
+            response_type: 'code',
+            scope: scope,
+          });
+          return authorizeBaseUrl + '?' + params.toString();
+        }
+
+        function refreshAuthorizeBtn() {
+          const url = buildAuthorizeUrl();
+          if (url) {
+            authorizeBtn.href = url;
+            authorizeBtn.classList.remove('pointer-events-none', 'opacity-50');
+            authorizeHint.textContent = '(opens the provider in a new tab)';
+          } else {
+            authorizeBtn.removeAttribute('href');
+            authorizeBtn.classList.add('pointer-events-none', 'opacity-50');
+            authorizeHint.textContent = '(enter API Key first)';
+          }
+        }
+
+        function setStatus(kind, text) {
+          statusEl.classList.remove('hidden', 'text-slate-600', 'text-red-600', 'text-emerald-700');
+          statusEl.classList.add(
+            kind === 'error' ? 'text-red-600' :
+            kind === 'success' ? 'text-emerald-700' : 'text-slate-600'
+          );
+          statusEl.textContent = text;
+        }
+
+        function replaceWithSelect(targetField, options) {
+          const targetInput = document.getElementById('cred-' + targetField);
+          if (!targetInput) return;
+          const select = document.createElement('select');
+          select.id = targetInput.id;
+          select.name = targetInput.name;
+          select.required = true;
+          select.className = targetInput.className;
+          for (const opt of options) {
+            const o = document.createElement('option');
+            o.value = opt.value;
+            o.textContent = opt.label;
+            select.appendChild(o);
+          }
+          targetInput.replaceWith(select);
+        }
+
+        if (clientIdInput) clientIdInput.addEventListener('input', refreshAuthorizeBtn);
+        refreshAuthorizeBtn();
+
+        if (exchangeBtn) exchangeBtn.addEventListener('click', async () => {
+          const url = (redirectInput.value || '').trim();
+          const cid = (clientIdInput && clientIdInput.value || '').trim();
+          const csec = (clientSecretInput && clientSecretInput.value || '').trim();
+          if (!url) { setStatus('error', 'Paste the redirect URL first.'); return; }
+          if (!cid || !csec) { setStatus('error', 'Fill API Key and API Secret above first.'); return; }
+          exchangeBtn.disabled = true;
+          setStatus('info', 'Exchanging code for refresh token…');
+          try {
+            const r = await fetch('/integrations/' + id + '/oauth-exchange', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ client_id: cid, client_secret: csec, redirect_url: url }),
+            });
+            const data = await r.json();
+            if (!r.ok || !data.refresh_token) {
+              setStatus('error', data.error || ('Exchange failed (' + r.status + ')'));
+              exchangeBtn.disabled = false;
+              return;
+            }
+            if (refreshInput) refreshInput.value = data.refresh_token;
+            if (data.discovery_options && data.discovery_target_field) {
+              replaceWithSelect(data.discovery_target_field, data.discovery_options);
+            }
+            setStatus('success', 'Refresh token saved. Review the form below and click Activate.');
+          } catch (e) {
+            setStatus('error', String(e));
+            exchangeBtn.disabled = false;
+          }
+        });
+      })();
+      </script>
+    `;
+}
+
 app.get("/integrations/:id/activate", (c) => {
     const id = c.req.param("id");
     const m = loadManifest(id);
     if (!m) return c.html(errorPage("No such integration"));
-    const credFields = (m.credentials ?? []).map((cred: any) => `
-        <div>
-          <label class="block text-sm font-medium mb-1">${escapeHtml(cred.label ?? cred.key)}${cred.secret ? " <span class='text-xs text-slate-400 font-normal'>(secret)</span>" : ""}</label>
-          <input name="${escapeHtml(cred.key)}" required
+    const oauth = m.oauth as OAuthManifest | undefined;
+    const discoveryTarget = oauth ? discoveryTargetField(oauth, m) : undefined;
+    const credFields = (m.credentials ?? []).map((cred: any) => {
+        // Refresh-token + discovery-target fields are JS-populated by the
+        // OAuth helper, so we don't mark them `required` (the form still
+        // posts their values on submit). Without this the browser would
+        // refuse to submit the form before the user has run the helper.
+        const isAutoFilled = !!oauth && (
+            cred.key === oauth.refresh_token_field ||
+            (!!discoveryTarget && cred.key === discoveryTarget)
+        );
+        return `
+        <div data-cred="${escapeHtml(cred.key)}">
+          <label class="block text-sm font-medium mb-1">${escapeHtml(cred.label ?? cred.key)}${cred.secret ? " <span class='text-xs text-slate-400 font-normal'>(secret)</span>" : ""}${isAutoFilled ? " <span class='text-xs text-emerald-600 font-normal'>(auto-filled by OAuth helper)</span>" : ""}</label>
+          <input id="cred-${escapeHtml(cred.key)}" name="${escapeHtml(cred.key)}" ${isAutoFilled ? "" : "required"}
                  ${cred.secret ? 'type="password" autocomplete="new-password"' : 'type="text" autocomplete="off"'}
                  spellcheck="false" autocapitalize="off" autocorrect="off"
                  data-1p-ignore data-lpignore="true" data-bwignore="true"
                  class="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm">
           ${cred.description ? `<p class="text-xs text-slate-500 mt-1">${escapeHtml(cred.description)}</p>` : ""}
         </div>
-    `).join("");
+    `;}).join("");
     const toolsDir = process.env.AGENTHQ_TOOLS_DIR ?? "/opt/agents/tools";
     const setupPath = `${toolsDir}/${id}/setup.md`;
     const setupMd = existsSync(setupPath) ? readFileSync(setupPath, "utf8") : "";
+    const oauthHelper = oauth ? renderOAuthHelper(id, oauth) : "";
 
     return c.html(layout(`Activate ${m.title ?? id}`, `
         <div class="mb-6">
@@ -719,6 +917,7 @@ app.get("/integrations/:id/activate", (c) => {
             <p class="text-xs text-slate-500 mb-4">Encrypted into the systemd-creds vault. Never logged or echoed.</p>
             <form method="POST" action="/integrations/${id}/activate" class="space-y-4">
               ${credFields}
+              ${oauthHelper}
               <div class="pt-2 flex gap-2">
                 ${button(`Activate`)}
                 ${button("Cancel", { href: `/integrations/${id}`, intent: "secondary" })}
@@ -727,6 +926,119 @@ app.get("/integrations/:id/activate", (c) => {
           </div>
         </div>
     `, "integrations", c.get("user")));
+});
+
+// POST /integrations/:id/oauth-exchange
+//
+// Called by the OAuth helper JS in the activate page. Body shape:
+//   { client_id, client_secret, redirect_url }
+// where redirect_url is the FULL pasted URL the upstream provider
+// redirected the user to (e.g. http://localhost/?code=ABC...). The
+// handler parses the `code` out of the URL, POSTs to oauth.token_url
+// with grant_type=authorization_code, returns the refresh_token, and —
+// if the manifest declares a discovery hook — runs that hook with the
+// freshly-acquired access_token to populate dependent fields.
+app.post("/integrations/:id/oauth-exchange", async (c) => {
+    const id = c.req.param("id");
+    const m = loadManifest(id);
+    if (!m || !m.oauth) {
+        return c.json({ error: "Integration has no OAuth configuration" }, 400);
+    }
+    const oauth = m.oauth as OAuthManifest;
+
+    let body: { client_id?: string; client_secret?: string; redirect_url?: string };
+    try { body = await c.req.json(); } catch { return c.json({ error: "Invalid JSON body" }, 400); }
+    const clientId = (body.client_id ?? "").trim();
+    const clientSecret = (body.client_secret ?? "").trim();
+    const redirectUrl = (body.redirect_url ?? "").trim();
+    if (!clientId || !clientSecret || !redirectUrl) {
+        return c.json({ error: "client_id, client_secret, and redirect_url are required" }, 400);
+    }
+
+    // Pull `code` out of the pasted URL. If the user happened to copy
+    // just the bare code instead of the whole URL, accept that too —
+    // URL parsing rejects bare strings, so sniff for a leading scheme.
+    let code: string | null = null;
+    if (/^https?:\/\//i.test(redirectUrl)) {
+        try { code = new URL(redirectUrl).searchParams.get("code"); }
+        catch { return c.json({ error: "Could not parse the URL you pasted." }, 400); }
+    } else if (redirectUrl.length > 4 && !redirectUrl.includes(" ")) {
+        code = redirectUrl;
+    }
+    if (!code) {
+        return c.json({ error: "No `code` parameter found in the pasted URL. Make sure you copied the full URL the browser ended on after sign-in." }, 400);
+    }
+
+    // Exchange code → tokens. Form-encoded per OAuth2 spec.
+    const tokenForm = new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        redirect_uri: oauth.redirect_uri,
+        code,
+        grant_type: "authorization_code",
+    });
+    let tokenResp: Response;
+    try {
+        tokenResp = await fetch(oauth.token_url, {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: tokenForm.toString(),
+        });
+    } catch (e) {
+        return c.json({ error: `Could not reach ${oauth.token_url}: ${String(e)}` }, 502);
+    }
+    const tokenText = await tokenResp.text();
+    if (!tokenResp.ok) {
+        return c.json({ error: `Token exchange failed (${tokenResp.status}): ${tokenText.slice(0, 400)}` }, 400);
+    }
+    let tokenData: any;
+    try { tokenData = JSON.parse(tokenText); }
+    catch { return c.json({ error: `Token endpoint returned non-JSON: ${tokenText.slice(0, 200)}` }, 502); }
+    const refreshToken = tokenData.refresh_token;
+    const accessToken = tokenData.access_token;
+    if (!refreshToken) {
+        return c.json({ error: `Token response did not include a refresh_token. Make sure the requested scope includes offline_access.` }, 400);
+    }
+
+    // Optional discovery hook — runs with the access token we just got.
+    // Best-effort: a discovery failure leaves the field as a plain text
+    // input so the user can still type the value by hand.
+    let discoveryOptions: { value: string; label: string }[] | undefined;
+    let discoveryTarget: string | undefined;
+    if (oauth.discovery === "myob_company_files" && accessToken) {
+        try {
+            const r = await fetch("https://api.myob.com/accountright/", {
+                headers: {
+                    "Authorization": `Bearer ${accessToken}`,
+                    "x-myobapi-key": clientId,
+                    "x-myobapi-version": "v2",
+                    "Accept": "application/json",
+                },
+            });
+            if (r.ok) {
+                const files: any = await r.json();
+                // MYOB returns a top-level array of CompanyFile records, each
+                // with Uri ending in /<GUID>. Pull the GUID for the value;
+                // build a friendly label from Name + Country.
+                const arr: any[] = Array.isArray(files) ? files : (files?.Items ?? []);
+                discoveryOptions = arr.map((f: any) => {
+                    const uri: string = f.Uri ?? "";
+                    const guid = uri.split("/").filter(Boolean).pop() ?? "";
+                    const country = f.Country ? ` — ${f.Country}` : "";
+                    return { value: guid, label: `${f.Name ?? guid}${country}` };
+                }).filter((o) => o.value);
+                discoveryTarget = "myob_business_id";
+            }
+        } catch {
+            // Best-effort: leave the field as plain text on failure.
+        }
+    }
+
+    return c.json({
+        refresh_token: refreshToken,
+        discovery_options: discoveryOptions,
+        discovery_target_field: discoveryTarget,
+    });
 });
 
 app.post("/integrations/:id/activate", async (c) => {
