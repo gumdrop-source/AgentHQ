@@ -112,8 +112,14 @@ def _save_refresh_token(value: str) -> None:
 # tool calls in the same MCP session share the cache; if two land in the
 # same window only one round-trip to MYOB happens.
 _token_lock = threading.Lock()
-_access_token: str | None = None
-_access_token_expires_at: float = 0.0
+# Cached access token + expiry (Unix epoch seconds). Underscored-with-suffix
+# to avoid colliding with the _access_token() accessor below — Python has no
+# warning when a name on a `def` line shadows a module-level variable, and
+# `global _access_token` inside the function would silently reassign the
+# function reference itself, breaking the next call with "'str' object is
+# not callable".
+_cached_access_token: str | None = None
+_cached_access_token_expires_at: float = 0.0
 
 
 def _refresh_access_token() -> str:
@@ -155,14 +161,14 @@ def _refresh_access_token() -> str:
 
 
 def _access_token() -> str:
-    global _access_token, _access_token_expires_at
+    global _cached_access_token, _cached_access_token_expires_at
     with _token_lock:
         now = time.time()
-        if _access_token and now < _access_token_expires_at:
-            return _access_token
+        if _cached_access_token and now < _cached_access_token_expires_at:
+            return _cached_access_token
         token = _refresh_access_token()
-        _access_token = token
-        _access_token_expires_at = now + ACCESS_TOKEN_TTL_SECONDS
+        _cached_access_token = token
+        _cached_access_token_expires_at = now + ACCESS_TOKEN_TTL_SECONDS
         return token
 
 
@@ -188,10 +194,16 @@ def _get(path: str, params: dict[str, Any] | None = None) -> Any:
     if r.status_code == 401:
         # Stale access token (clock skew, MYOB invalidated early). Force a
         # refresh and retry once before failing the call.
-        global _access_token_expires_at
-        _access_token_expires_at = 0.0
+        global _cached_access_token_expires_at
+        _cached_access_token_expires_at = 0.0
         r = requests.get(url, headers=_headers(), params=params, timeout=30)
-    r.raise_for_status()
+    if not r.ok:
+        # Surface MYOB's error envelope into the message so the agent (and
+        # future-Claude debugging this) sees what actually failed instead of
+        # a bare "400 Client Error". MYOB returns JSON like
+        # {"Errors":[{"Message":"...","AdditionalDetails":"..."}]}.
+        body = r.text[:500] if r.text else ""
+        raise RuntimeError(f"MYOB GET {path} failed ({r.status_code}): {body}")
     if not r.content:
         return None
     return r.json()
@@ -291,12 +303,17 @@ REPORTING_BASES = {"Accrual", "Cash"}
 def _pl_call(start_date: str, end_date: str, basis: str) -> dict:
     if basis not in REPORTING_BASES:
         raise ValueError(f"basis must be 'Accrual' or 'Cash', got {basis!r}")
+    # MYOB requires YearEndAdjust on the P&L endpoint as of late 2025.
+    # `false` matches what the AccountRight UI uses by default — only flip
+    # to `true` if you want the report to include year-end posting
+    # adjustments (typically only relevant for the closing month of FY).
     return _get(
         "/Report/ProfitAndLossSummary",
         params={
             "startDate": start_date,
             "endDate": end_date,
             "reportingBasis": basis,
+            "yearEndAdjust": "false",
         },
     )
 
@@ -448,13 +465,27 @@ def myob_employee_standard_pay(uid: str) -> dict:
 
 
 # Hours per workday for converting leave hours → days. MYOB doesn't expose
-# this on the entitlement record so we infer from the employee's
-# HoursInWeeklyPayPeriod (assumed 5-day week). Falls back to 7.6 if
-# missing — Australia's notional standard for a full-time week of 38h.
+# this on the entitlement record so we infer from Wage.HoursInWeeklyPayPeriod
+# combined with PayFrequency. The field name is misleading: for Fortnightly
+# employees it's actually hours over a fortnight (80 = 8h × 10 working days),
+# not over a single week. Always divide by working-days-in-period.
+PERIOD_WORKING_DAYS = {
+    "Weekly": 5,
+    "Fortnightly": 10,
+    "Monthly": 22,           # standard payroll convention: 22 working days/mo
+    "Bimonthly": 11,         # twice per month — half a month of working days
+    "Quarterly": 65,         # ~22 × 3
+}
+
+
 def _hours_per_day(payroll: dict) -> float:
-    weekly = ((payroll.get("Wage") or {}).get("HoursInWeeklyPayPeriod"))
-    if isinstance(weekly, (int, float)) and weekly > 0:
-        return float(weekly) / 5.0
+    wage = payroll.get("Wage") or {}
+    period_hours = wage.get("HoursInWeeklyPayPeriod")
+    pay_freq = wage.get("PayFrequency") or "Weekly"
+    days = PERIOD_WORKING_DAYS.get(pay_freq, 5)
+    if isinstance(period_hours, (int, float)) and period_hours > 0 and days > 0:
+        return float(period_hours) / float(days)
+    # Fall back to Australia's notional 38h week / 5 days = 7.6h/day.
     return 7.6
 
 
@@ -471,11 +502,34 @@ def myob_employee_leave_balance(name: str) -> dict:
     """
     if not name or not name.strip():
         raise ValueError("name is required")
+    needle = name.strip()
 
-    # Try last name first (more selective in most orgs), then first name.
-    matches = myob_employee_lookup(last_name=name.strip())
+    # Try fast OData exact-match queries first (cheap, indexed). Last name
+    # is more selective in most orgs, then first name.
+    matches = myob_employee_lookup(last_name=needle)
     if not matches:
-        matches = myob_employee_lookup(first_name=name.strip())
+        matches = myob_employee_lookup(first_name=needle)
+
+    # Fallback: MYOB OData has no contains() / startswith() that we can rely
+    # on, so a name like "Saraiva" never matches LastName="Dos Santos
+    # Saraiva". Fetch the full active-employee list (small enough — most
+    # AccountRight files have <500 employees) and substring-match
+    # case-insensitively against First/Last/DisplayID.
+    if not matches:
+        try:
+            data = _get("/Contact/Employee", params={"$top": 1000})
+            all_emps = data.get("Items", []) if isinstance(data, dict) else []
+        except Exception:
+            all_emps = []
+        ndl = needle.lower()
+        fuzzy = [
+            e for e in all_emps
+            if ndl in (e.get("FirstName") or "").lower()
+            or ndl in (e.get("LastName") or "").lower()
+            or ndl in (e.get("DisplayID") or "").lower()
+        ]
+        matches = [_summarize_employee(e) for e in fuzzy]
+
     if not matches:
         return {
             "employee": None,
@@ -507,7 +561,9 @@ def myob_employee_leave_balance(name: str) -> dict:
         total = ent.get("Total")
         if total is None:
             total = (carry or 0.0) + (ytd or 0.0)
-        cat = ent.get("PayrollCategory") or {}
+        # MYOB nests the category under "EntitlementCategory" on entitlement
+        # records (not "PayrollCategory" — that's the wage-record key).
+        cat = ent.get("EntitlementCategory") or ent.get("PayrollCategory") or {}
         assigned.append(
             {
                 "name": cat.get("Name"),
