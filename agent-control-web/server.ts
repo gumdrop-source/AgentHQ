@@ -765,7 +765,7 @@ function renderOAuthHelper(id: string, oauth: OAuthManifest): string {
         <!-- Stage 3 — discovery picker (only shown when >1 result) ──────── -->
         <div data-oauth-stage="3" class="hidden space-y-2">
           <label class="block text-sm font-medium text-slate-900" data-oauth-discovery-label>Choose:</label>
-          <select data-oauth-discovery-select required
+          <select data-oauth-discovery-select
                   class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm bg-white"></select>
         </div>
 
@@ -1077,6 +1077,10 @@ app.post("/integrations/:id/oauth-exchange", async (c) => {
     let discoveryOptions: { value: string; label: string }[] | undefined;
     let discoveryTarget: string | undefined;
     if (oauth.discovery === "myob_company_files" && accessToken) {
+        // The endpoint returns a top-level JSON array of CompanyFile records.
+        // We log the response shape on every call so a parsing surprise is
+        // diagnosable from journalctl rather than silently re-prompting the
+        // operator for a GUID they shouldn't have to know.
         try {
             const r = await fetch("https://api.myob.com/accountright/", {
                 headers: {
@@ -1086,22 +1090,30 @@ app.post("/integrations/:id/oauth-exchange", async (c) => {
                     "Accept": "application/json",
                 },
             });
-            if (r.ok) {
-                const files: any = await r.json();
-                // MYOB returns a top-level array of CompanyFile records, each
-                // with Uri ending in /<GUID>. Pull the GUID for the value;
-                // build a friendly label from Name + Country.
-                const arr: any[] = Array.isArray(files) ? files : (files?.Items ?? []);
+            const bodyText = await r.text();
+            console.log(`[oauth-discovery:${id}] status=${r.status} body=${bodyText.slice(0, 800)}`);
+            if (r.ok && bodyText) {
+                let files: any;
+                try { files = JSON.parse(bodyText); } catch { files = null; }
+                // Accept top-level array, OData-style {value: [...]}, or
+                // {Items: [...]}. Each CompanyFile has Uri (ending /<GUID>)
+                // or Id; some responses use lowercase. Be liberal.
+                let arr: any[] = [];
+                if (Array.isArray(files)) arr = files;
+                else if (Array.isArray(files?.value)) arr = files.value;
+                else if (Array.isArray(files?.Items)) arr = files.Items;
                 discoveryOptions = arr.map((f: any) => {
-                    const uri: string = f.Uri ?? "";
-                    const guid = uri.split("/").filter(Boolean).pop() ?? "";
-                    const country = f.Country ? ` — ${f.Country}` : "";
-                    return { value: guid, label: `${f.Name ?? guid}${country}` };
+                    const uri: string = f.Uri ?? f.uri ?? "";
+                    const guid = (uri.split("/").filter(Boolean).pop() ?? "")
+                                 || f.Id || f.id || "";
+                    const name = f.Name ?? f.name ?? guid;
+                    const country = (f.Country ?? f.country) ? ` — ${f.Country ?? f.country}` : "";
+                    return { value: String(guid), label: `${name}${country}` };
                 }).filter((o) => o.value);
                 discoveryTarget = "myob_business_id";
             }
-        } catch {
-            // Best-effort: leave the field as plain text on failure.
+        } catch (e) {
+            console.log(`[oauth-discovery:${id}] error=${String(e)}`);
         }
     }
 
