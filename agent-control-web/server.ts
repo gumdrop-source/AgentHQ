@@ -512,6 +512,10 @@ async function writeSystemdDropIn(agentName: string): Promise<void> {
         for (const cred of (manifest.credentials ?? [])) {
             const key = cred.key;
             if (!/^[a-zA-Z0-9_-]+$/.test(key)) continue;
+            // Optional creds: only emit a LoadCredentialEncrypted line if
+            // the operator actually provided a value. Otherwise systemd
+            // would refuse to start the unit on the missing .cred file.
+            if (cred.optional && !existsSync(`/etc/agents/credentials/${key}.cred`)) continue;
             mcpLines.push(`LoadCredentialEncrypted=${key}:/etc/agents/credentials/${key}.cred`);
         }
     }
@@ -706,6 +710,11 @@ type OAuthManifest = {
     client_secret_field: string;
     refresh_token_field: string;
     discovery?: string;
+    // Optional HTML snippet shown to the operator when discovery returns
+    // zero results — should explain how to find the value by hand.
+    // Lives in the manifest because it's tool-specific (where to find the
+    // company file GUID isn't transferable to other OAuth integrations).
+    discovery_fallback_help?: string;
 };
 
 // Returns the credential key whose value will be auto-filled by the
@@ -719,7 +728,28 @@ function discoveryTargetField(oauth: OAuthManifest, m: any): string | undefined 
     return undefined;
 }
 
-function renderOAuthHelper(id: string, oauth: OAuthManifest): string {
+function renderOAuthHelper(id: string, oauth: OAuthManifest, m: any): string {
+    // Detect "discovery-only" mode: the manifest declares an OAuth flow but
+    // the refresh_token field is hidden, meaning the wizard isn't trying to
+    // save an admin token — it's only running the dance to auto-fill the
+    // discovery target (e.g. company file GUID). Reframe the UI so the
+    // operator doesn't see a "Sign in" button that suggests they're
+    // authenticating the integration itself (in per-user mode they're not —
+    // each end user signs in via their own auth dance later).
+    const refreshCred = (m.credentials ?? []).find(
+        (c: any) => c.key === oauth.refresh_token_field,
+    );
+    const discoveryOnly = !!refreshCred && !!refreshCred.hidden && !!oauth.discovery;
+    const discoveryNoun = oauth.discovery === "myob_company_files" ? "company file" : "account";
+    const helperTitle = discoveryOnly
+        ? `Auto-fill your ${discoveryNoun}`
+        : "Authorize this integration";
+    const helperSubtitle = discoveryOnly
+        ? `Fill <strong>API Key</strong> and <strong>API Secret</strong> above, then sign in once so the wizard can fetch your ${discoveryNoun} ID without you typing it. Each end user will sign in separately for their own access.`
+        : "Fill in <strong>API Key</strong> and <strong>API Secret</strong> above, then come back here.";
+    const ctaLabel = discoveryOnly
+        ? `Find my ${discoveryNoun} →`
+        : "Sign in with provider →";
     return `
       <div class="rounded-xl border border-blue-200 bg-blue-50 p-4 space-y-3"
            data-oauth-helper
@@ -730,17 +760,19 @@ function renderOAuthHelper(id: string, oauth: OAuthManifest): string {
            data-authorize-url="${escapeHtml(oauth.authorize_url)}"
            data-redirect-uri="${escapeHtml(oauth.redirect_uri)}"
            data-scope="${escapeHtml(oauth.scope)}"
-           data-discovery="${escapeHtml(oauth.discovery ?? "")}">
+           data-discovery="${escapeHtml(oauth.discovery ?? "")}"
+           data-discovery-only="${discoveryOnly ? "true" : "false"}"
+           data-discovery-fallback-help="${escapeHtml(oauth.discovery_fallback_help ?? "")}">
         <div>
-          <h4 class="font-medium text-slate-900">Authorize this integration</h4>
-          <p class="text-xs text-slate-600 mt-1" data-oauth-stage-help>Fill in <strong>API Key</strong> and <strong>API Secret</strong> above, then come back here.</p>
+          <h4 class="font-medium text-slate-900">${escapeHtml(helperTitle)}</h4>
+          <p class="text-xs text-slate-600 mt-1" data-oauth-stage-help>${helperSubtitle}</p>
         </div>
 
         <!-- Stage 1 — kick off the OAuth dance ─────────────────────────── -->
         <div data-oauth-stage="1">
           <a href="#" data-oauth-authorize
              class="pointer-events-none opacity-50 block w-full text-center px-4 py-3 rounded-lg font-medium text-sm bg-slate-900 text-white hover:bg-slate-700"
-             target="_blank" rel="noopener noreferrer">Sign in with provider →</a>
+             target="_blank" rel="noopener noreferrer">${escapeHtml(ctaLabel)}</a>
           <p class="text-xs text-slate-500 mt-2" data-oauth-authorize-hint>(enter API Key first to enable)</p>
         </div>
 
@@ -880,13 +912,15 @@ function renderOAuthHelper(id: string, oauth: OAuthManifest): string {
             }
             if (refreshInput) refreshInput.value = data.refresh_token;
 
+            const discoveryOnly = helper.dataset.discoveryOnly === 'true';
+            const okWord = discoveryOnly ? 'Found.' : 'Authorized.';
             const opts = data.discovery_options || [];
             const target = data.discovery_target_field;
             if (target && opts.length === 1) {
               // Exactly one match — silently auto-fill, no UI noise.
               setHiddenValue(target, opts[0].value);
               showStage(0);
-              stageHelp.innerHTML = '<span class="text-emerald-700 font-medium">✓ Authorized.</span> Click <strong>Activate</strong> below to save.';
+              stageHelp.innerHTML = '<span class="text-emerald-700 font-medium">✓ ' + okWord + '</span> Click <strong>Activate</strong> below to save.';
               clearStatus();
             } else if (target && opts.length > 1) {
               // Multiple matches — let the user pick.
@@ -901,7 +935,7 @@ function renderOAuthHelper(id: string, oauth: OAuthManifest): string {
               setHiddenValue(target, discoverySelect.value);
               discoverySelect.addEventListener('change', () => setHiddenValue(target, discoverySelect.value));
               showStage(3);
-              stageHelp.innerHTML = '<span class="text-emerald-700 font-medium">✓ Authorized.</span> Pick the right option, then click <strong>Activate</strong> below.';
+              stageHelp.innerHTML = '<span class="text-emerald-700 font-medium">✓ ' + okWord + '</span> Pick the right option, then click <strong>Activate</strong> below.';
               clearStatus();
             } else if (target && opts.length === 0) {
               // Discovery declared but returned nothing — surface the
@@ -910,15 +944,21 @@ function renderOAuthHelper(id: string, oauth: OAuthManifest): string {
               const wrapper = document.querySelector('[data-cred="' + target + '"]');
               const input   = document.getElementById('cred-' + target);
               if (wrapper) wrapper.classList.remove('hidden');
-              if (input)  { input.type = 'text'; input.required = true; }
-              stageHelp.innerHTML = '<span class="text-amber-700 font-medium">Authorized,</span> but auto-discovery returned no options — please fill the remaining field by hand and click Activate.';
+              if (input)  { input.type = 'text'; input.required = true; input.focus(); }
+              const fallbackHelp = helper.dataset.discoveryFallbackHelp || '';
+              const helpBlock = fallbackHelp
+                ? '<div class="mt-2 rounded-lg bg-white border border-amber-300 p-3 text-xs text-slate-700 space-y-1">' + fallbackHelp + '</div>'
+                : '';
+              stageHelp.innerHTML =
+                '<span class="text-amber-700 font-medium">Auto-discovery returned no options</span> — please fill the remaining field by hand and click Activate.'
+                + helpBlock;
               clearStatus();
             } else {
               // Manifest declares no discovery — only the refresh_token
               // was hidden, and it's now populated. Operator just clicks
               // Activate.
               showStage(0);
-              stageHelp.innerHTML = '<span class="text-emerald-700 font-medium">✓ Authorized.</span> Click <strong>Activate</strong> below to save.';
+              stageHelp.innerHTML = '<span class="text-emerald-700 font-medium">✓ ' + okWord + '</span> Click <strong>Activate</strong> below to save.';
               clearStatus();
             }
           } catch (e) {
@@ -938,28 +978,39 @@ app.get("/integrations/:id/activate", (c) => {
     const oauth = m.oauth as OAuthManifest | undefined;
     const discoveryTarget = oauth ? discoveryTargetField(oauth, m) : undefined;
     const credFields = (m.credentials ?? []).map((cred: any) => {
-        // Refresh-token + discovery-target fields are JS-populated by the
-        // OAuth helper, so we render them as hidden inputs the operator
-        // never sees. They still post on submit. The discovery-target
-        // wrapper carries data-cred so the JS can re-surface it as a
-        // visible input if discovery returns zero options.
-        const isAutoFilled = !!oauth && (
-            cred.key === oauth.refresh_token_field ||
-            (!!discoveryTarget && cred.key === discoveryTarget)
-        );
+        // Hidden creds: never rendered, never posted. Used for things
+        // operators shouldn't have to think about during activation
+        // (e.g. myob_refresh_token, which is per-user and onboarded
+        // through Telegram, not the wizard).
+        if (cred.hidden) return "";
+        // Auto-filled creds: discovery-target fields rendered as
+        // type=hidden so the OAuth helper can populate them silently.
+        // They still post on submit. The wrapper carries data-cred so
+        // the JS can re-surface them if discovery returns zero options.
+        const isAutoFilled = !!oauth && !!discoveryTarget && cred.key === discoveryTarget;
         if (isAutoFilled) {
+            // Same template as a regular field, just wrapped in a hidden
+            // div + initial type=hidden. When discovery fails the JS
+            // un-hides the wrapper and flips type back to text — matching
+            // styling means the re-surfaced input is visually identical
+            // to the API Key / API Secret inputs above it.
             return `
         <div data-cred="${escapeHtml(cred.key)}" class="hidden">
           <label class="block text-sm font-medium mb-1">${escapeHtml(cred.label ?? cred.key)}</label>
           <input id="cred-${escapeHtml(cred.key)}" name="${escapeHtml(cred.key)}"
-                 type="hidden">
+                 type="hidden"
+                 spellcheck="false" autocapitalize="off" autocorrect="off"
+                 data-1p-ignore data-lpignore="true" data-bwignore="true"
+                 class="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm">
+          ${cred.description ? `<p class="text-xs text-slate-500 mt-1">${escapeHtml(cred.description)}</p>` : ""}
         </div>
     `;
         }
+        const isOptional = !!cred.optional;
         return `
         <div data-cred="${escapeHtml(cred.key)}">
-          <label class="block text-sm font-medium mb-1">${escapeHtml(cred.label ?? cred.key)}${cred.secret ? " <span class='text-xs text-slate-400 font-normal'>(secret)</span>" : ""}</label>
-          <input id="cred-${escapeHtml(cred.key)}" name="${escapeHtml(cred.key)}" required
+          <label class="block text-sm font-medium mb-1">${escapeHtml(cred.label ?? cred.key)}${cred.secret ? " <span class='text-xs text-slate-400 font-normal'>(secret)</span>" : ""}${isOptional ? " <span class='text-xs text-slate-400 font-normal'>(optional)</span>" : ""}</label>
+          <input id="cred-${escapeHtml(cred.key)}" name="${escapeHtml(cred.key)}"${isOptional ? "" : " required"}
                  ${cred.secret ? 'type="password" autocomplete="new-password"' : 'type="text" autocomplete="off"'}
                  spellcheck="false" autocapitalize="off" autocorrect="off"
                  data-1p-ignore data-lpignore="true" data-bwignore="true"
@@ -970,7 +1021,7 @@ app.get("/integrations/:id/activate", (c) => {
     const toolsDir = process.env.AGENTHQ_TOOLS_DIR ?? "/opt/agents/tools";
     const setupPath = `${toolsDir}/${id}/setup.md`;
     const setupMd = existsSync(setupPath) ? readFileSync(setupPath, "utf8") : "";
-    const oauthHelper = oauth ? renderOAuthHelper(id, oauth) : "";
+    const oauthHelper = oauth ? renderOAuthHelper(id, oauth, m) : "";
 
     return c.html(layout(`Activate ${m.title ?? id}`, `
         <div class="mb-6">
@@ -1133,8 +1184,14 @@ app.post("/integrations/:id/activate", async (c) => {
     const errors: string[] = [];
 
     for (const cred of (m.credentials ?? [])) {
+        // Hidden creds are never surfaced in the form, so they're never
+        // posted. Skip them entirely — admins set hidden creds via CLI.
+        if (cred.hidden) continue;
         const value = String(body[cred.key] ?? "").trim();
         if (!value) {
+            // Skip empty optional creds — they're nice-to-have, not required.
+            // Required missing creds still surface as errors below.
+            if (cred.optional) continue;
             errors.push(`Missing value for ${cred.key}`);
             continue;
         }
@@ -1158,7 +1215,7 @@ app.get("/integrations/:id/configure", (c) => {
     const m = loadManifest(id);
     if (!m) return c.html(errorPage("No such integration"));
 
-    const credList = (m.credentials ?? []).map((cred: any) => {
+    const credList = (m.credentials ?? []).filter((cred: any) => !cred.hidden).map((cred: any) => {
         const stored = existsSync(`/etc/agents/credentials/${cred.key}.cred`);
         return `<li class="flex items-center justify-between py-1.5 border-b border-slate-100 last:border-0">
           <span class="font-mono text-sm">${escapeHtml(cred.key)}</span>
@@ -1168,15 +1225,192 @@ app.get("/integrations/:id/configure", (c) => {
         </li>`;
     }).join("");
 
-    return c.html(layout(`Configure ${m.title ?? id}`, card(`
-        ${pageHeader(`Configure ${escapeHtml(m.title ?? id)}`)}
-        <p class="text-sm text-slate-700 mb-3">Stored credentials (values not shown — they're encrypted in the vault):</p>
-        <ul class="mb-6">${credList}</ul>
-        <div class="flex gap-3">
-          <a href="/integrations/${id}/activate" class="inline-block px-4 py-2 rounded-lg font-medium bg-slate-100 text-slate-900 hover:bg-slate-200">Re-enter credentials</a>
-          ${button("Back", { href: `/integrations/${id}`, intent: "secondary" })}
+    return c.html(layout(`Configure ${m.title ?? id}`, `
+        ${card(`
+          ${pageHeader(`Configure ${escapeHtml(m.title ?? id)}`)}
+          <p class="text-sm text-slate-700 mb-3">Stored credentials (values not shown — they're encrypted in the vault):</p>
+          <ul class="mb-6">${credList}</ul>
+          <div class="flex gap-3">
+            <a href="/integrations/${id}/activate" class="inline-block px-4 py-2 rounded-lg font-medium bg-slate-100 text-slate-900 hover:bg-slate-200">Re-enter credentials</a>
+            ${button("Back", { href: `/integrations/${id}`, intent: "secondary" })}
+          </div>
+        `)}
+
+        <div class="mt-6 bg-white rounded-xl shadow-sm border border-rose-200 p-6">
+          <h3 class="font-medium text-rose-700 mb-1">Danger zone</h3>
+          <p class="text-sm text-slate-700 mb-4">Deactivating wipes the platform credentials and every per-user authorization. Agents that have this integration granted will keep the grant, but every user will need to re-authorize through Telegram on first use after re-activation.</p>
+          <a href="/integrations/${id}/deactivate" class="inline-block px-4 py-2 rounded-lg font-medium bg-rose-600 text-white hover:bg-rose-500">Deactivate integration</a>
         </div>
+    `, "integrations", c.get("user")));
+});
+
+// ─── Integration deactivation ──────────────────────────────────────────────
+//
+// Deactivation = wipe the vault credentials for this integration + every
+// per-agent persistent state file that belongs to it (per-user OAuth tokens,
+// pending auth states, legacy single-cache files), then regenerate each
+// affected agent's systemd cred drop-in so the missing creds don't block
+// the unit on next start. The integration card flips back to "Activate".
+//
+// We intentionally DON'T untick this tool's permissions in any agent's
+// agent.toml — re-activating later means agents that had the tool granted
+// still have it, with no manual re-permission step. The cost is that
+// between deactivate and re-activate, granted-but-uncredentialed tool
+// calls error with "MYOB platform credentials missing" — visible but not
+// catastrophic.
+
+// Per-tool helper. Returns the names of files/dirs under
+// /var/lib/agents/<agent>-mcp/ that belong to this tool. We use prefix
+// matching so the helper handles both "myob_*" siblings (myob_tokens,
+// myob_pending_auth, myob_refresh_token) and m365's leading-dot
+// pattern (.m365_token_cache.json) without per-tool wiring.
+function toolStateGlobs(toolId: string, mcpHome: string): string[] {
+    const candidates: string[] = [];
+    let entries: string[] = [];
+    try {
+        entries = readdirSync(mcpHome);
+    } catch {
+        return [];
+    }
+    for (const name of entries) {
+        if (name === toolId
+            || name.startsWith(`${toolId}_`)
+            || name.startsWith(`${toolId}.`)
+            || name.startsWith(`.${toolId}_`)
+            || name.startsWith(`.${toolId}.`)) {
+            candidates.push(`${mcpHome}/${name}`);
+        }
+    }
+    return candidates;
+}
+
+// Walk /home/* looking for agents whose agent.toml [tools].enabled
+// includes this tool. The launcher's allowlist gate is what makes
+// agent.toml authoritative, not settings.json.
+function agentsWithToolEnabled(toolId: string): string[] {
+    const agents: string[] = [];
+    let entries: string[] = [];
+    try {
+        entries = readdirSync("/home");
+    } catch {
+        return [];
+    }
+    for (const name of entries) {
+        const tomlPath = `/home/${name}/agent.toml`;
+        if (!existsSync(tomlPath)) continue;
+        let toml: string;
+        try {
+            toml = readFileSync(tomlPath, "utf8");
+        } catch {
+            continue;
+        }
+        // Crude but sufficient: the [tools].enabled line is rendered as
+        // `enabled = ["t1", "t2", ...]` — match the bare quoted name.
+        const m = toml.match(/^\s*enabled\s*=\s*\[([^\]]*)\]/m);
+        if (!m) continue;
+        const list = m[1].split(",").map((s) => s.trim().replace(/^"|"$/g, ""));
+        if (list.includes(toolId)) agents.push(name);
+    }
+    return agents;
+}
+
+app.get("/integrations/:id/deactivate", (c) => {
+    const id = c.req.param("id");
+    const m = loadManifest(id);
+    if (!m) return c.html(errorPage("No such integration"));
+
+    const credKeys = (m.credentials ?? []).map((cred: any) => cred.key as string);
+    const credsPresent = credKeys.filter((k) => existsSync(`/etc/agents/credentials/${k}.cred`));
+    const agents = agentsWithToolEnabled(id);
+
+    // Count what will be wiped per-agent so the operator sees the blast radius.
+    const perAgent = agents.map((name) => {
+        const home = `/var/lib/agents/${name}-mcp`;
+        const stateFiles = toolStateGlobs(id, home);
+        return { name, stateFiles };
+    });
+
+    const agentsHtml = perAgent.length === 0
+        ? `<p class="text-sm text-slate-500 italic">No agents currently have this integration granted.</p>`
+        : `<ul class="space-y-1">${perAgent.map((a) => `
+            <li class="text-sm">
+              <span class="font-mono">${escapeHtml(a.name)}</span>
+              <span class="text-xs text-slate-500 ml-2">${a.stateFiles.length} state file${a.stateFiles.length === 1 ? "" : "s"} to wipe</span>
+            </li>
+          `).join("")}</ul>`;
+
+    const credsHtml = credsPresent.length === 0
+        ? `<p class="text-sm text-slate-500 italic">No vault credentials currently stored.</p>`
+        : `<ul class="space-y-1">${credsPresent.map((k) => `
+            <li class="font-mono text-sm">${escapeHtml(k)}</li>
+          `).join("")}</ul>`;
+
+    return c.html(layout(`Deactivate ${m.title ?? id}`, card(`
+        ${pageHeader(`Deactivate ${escapeHtml(m.title ?? id)}`, "Review what will be removed before confirming.")}
+
+        <h4 class="font-medium text-slate-900 mt-4 mb-2">Vault credentials to wipe</h4>
+        ${credsHtml}
+
+        <h4 class="font-medium text-slate-900 mt-6 mb-2">Per-agent state to wipe</h4>
+        ${agentsHtml}
+
+        <p class="text-sm text-slate-700 mt-6">After deactivation:</p>
+        <ul class="text-sm text-slate-700 list-disc list-inside space-y-1 mt-1">
+          <li>The integration card flips back to <strong>Activate</strong>.</li>
+          <li>Each affected agent's systemd cred drop-in is regenerated and the agent is restarted.</li>
+          <li>Per-agent permissions are <strong>preserved</strong> — re-activating restores the integration without further setup, but every Telegram user will need to re-authorize on their first call.</li>
+        </ul>
+
+        <form method="POST" action="/integrations/${id}/deactivate" class="mt-6 flex gap-3">
+          <button type="submit" class="inline-block px-4 py-2 rounded-lg font-medium bg-rose-600 text-white hover:bg-rose-500">Yes, deactivate</button>
+          ${button("Cancel", { href: `/integrations/${id}/configure`, intent: "secondary" })}
+        </form>
     `), "integrations", c.get("user")));
+});
+
+app.post("/integrations/:id/deactivate", async (c) => {
+    const id = c.req.param("id");
+    const m = loadManifest(id);
+    if (!m) return c.html(errorPage("No such integration"));
+
+    const fs = await import("node:fs");
+    const errors: string[] = [];
+
+    // 1. Wipe vault entries for every cred this integration declared.
+    for (const cred of (m.credentials ?? [])) {
+        const path = `/etc/agents/credentials/${cred.key}.cred`;
+        if (!existsSync(path)) continue;
+        try {
+            fs.rmSync(path, { force: true });
+        } catch (e) {
+            errors.push(`vault: ${cred.key}: ${String(e)}`);
+        }
+    }
+
+    // 2. Wipe per-agent state for every agent that had this tool granted,
+    //    and regenerate their systemd cred drop-in so the missing vault
+    //    files don't block the unit on next start.
+    const affectedAgents = agentsWithToolEnabled(id);
+    for (const name of affectedAgents) {
+        const home = `/var/lib/agents/${name}-mcp`;
+        for (const path of toolStateGlobs(id, home)) {
+            try {
+                fs.rmSync(path, { recursive: true, force: true });
+            } catch (e) {
+                errors.push(`state ${name}: ${String(e)}`);
+            }
+        }
+        try {
+            await writeSystemdDropIn(name);
+        } catch (e) {
+            errors.push(`drop-in ${name}: ${String(e)}`);
+        }
+    }
+
+    if (errors.length > 0) {
+        return c.html(errorPage(`Deactivation finished with errors`, errors.join("; ")));
+    }
+    return c.redirect("/integrations");
 });
 
 app.get("/updates", (c) => c.html(layout("Updates", card(`

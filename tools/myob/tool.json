@@ -1,7 +1,7 @@
 {
   "name": "myob",
   "title": "MYOB AccountRight",
-  "description": "Read-only access to MYOB AccountRight Live: chart of accounts, P&L reports, employee payroll details (incl. leave balances), and wage/entitlement categories.",
+  "description": "Read-only access to MYOB AccountRight Live: chart of accounts, P&L reports, employee payroll details (incl. leave balances), and wage/entitlement categories. Each user authenticates against their own my.MYOB account on first use, so queries return only data their MYOB account is scoped for.",
   "credentials": [
     {
       "key": "myob_client_id",
@@ -17,17 +17,19 @@
       "description": "Shown as 'Secret' on the same registered-app page. (OAuth2 calls this the client_secret.)"
     },
     {
-      "key": "myob_refresh_token",
-      "label": "Refresh Token",
-      "env": "MYOB_REFRESH_TOKEN",
-      "secret": true,
-      "description": "Initial OAuth refresh token. Rotates on every refresh — the running tool persists the latest value to its own writable cache."
-    },
-    {
       "key": "myob_business_id",
       "label": "Company File GUID",
       "env": "MYOB_BUSINESS_ID",
-      "description": "GUID of the AccountRight company file. The wizard auto-discovers and pre-fills this after the OAuth handshake — typically you don't need to type it."
+      "description": "GUID of the AccountRight company file. The wizard auto-discovers and pre-fills this after the OAuth handshake — you typically don't need to type it."
+    },
+    {
+      "key": "myob_refresh_token",
+      "label": "Admin Refresh Token",
+      "env": "MYOB_REFRESH_TOKEN",
+      "secret": true,
+      "optional": true,
+      "hidden": true,
+      "description": "Not surfaced in the wizard. Each Telegram user runs their own sign-in dance the first time they ask the bot anything MYOB-related — no platform-level token needed. Admins who want a platform token for direct/CLI use can set it via `sudo agenthq-cred set myob_refresh_token`."
     }
   ],
   "oauth": {
@@ -38,9 +40,16 @@
     "client_id_field": "myob_client_id",
     "client_secret_field": "myob_client_secret",
     "refresh_token_field": "myob_refresh_token",
-    "discovery": "myob_company_files"
+    "discovery": "myob_company_files",
+    "discovery_fallback_help": "<p>Open your company file in the AccountRight browser at <a class=\"underline text-blue-700\" target=\"_blank\" rel=\"noopener noreferrer\" href=\"https://app.myob.com\">app.myob.com</a>. Once the file is open, your browser URL looks like:</p><pre class=\"mt-1 px-2 py-1 bg-white border border-slate-200 rounded text-xs font-mono whitespace-pre-wrap break-all\">https://app.myob.com/#/au/&lt;COMPANY-FILE-GUID&gt;/dashboard</pre><p class=\"mt-1\">Copy the long string between <code class=\"px-1 bg-white border border-slate-200 rounded text-xs\">/au/</code> and <code class=\"px-1 bg-white border border-slate-200 rounded text-xs\">/dashboard</code> and paste it below.</p>"
   },
   "tools": {
+    "myob_complete_auth": {
+      "description": "Finish the per-user OAuth dance — pass the redirect URL the user copied back from their browser"
+    },
+    "myob_who_am_i": {
+      "description": "Diagnostic: report whether the calling user has linked their MYOB account"
+    },
     "myob_company_file_info": {
       "description": "Sanity check + company file metadata (name, AccountRight version, last sync time)"
     },

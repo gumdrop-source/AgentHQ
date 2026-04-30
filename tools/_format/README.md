@@ -60,8 +60,25 @@ matrix.
 
 ## Special cases
 
-- **`destructive: true`** — the permission matrix UI shows this tool
-  with a warning icon and requires explicit confirmation when granting.
+- **`destructive: true`** (on a tool entry) — the permission matrix UI
+  shows this tool with a warning icon and requires explicit confirmation
+  when granting.
+- **`optional: true`** (on a credential entry) — the wizard renders
+  the field without `required` and accepts blank submission. Drop-in
+  generators only emit `LoadCredentialEncrypted` for optional creds
+  whose `.cred` file actually exists in the vault, so a missing
+  optional cred doesn't block the unit from starting.
+- **`hidden: true`** (on a credential entry) — the wizard doesn't
+  render the field at all (implies `optional: true`). Used for
+  credentials operators shouldn't have to think about during
+  activation — e.g. `myob_refresh_token`, which is provisioned
+  per-user through the agent's auth dance, not the wizard. Admins
+  who genuinely want to set a hidden cred can do so via
+  `sudo agenthq-cred set <key>`.
+- **`oauth` block** — when present, the activate page renders an
+  inline helper that walks the operator through an OAuth
+  authorization-code flow with optional auto-discovery. See myob's
+  manifest for the field shape.
 - **Plugin-exposed tools** (like `telegram`, `claude-mem`) don't live
   under `tools/`. They're treated as built-in and always granted.
 

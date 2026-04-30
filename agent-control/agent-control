@@ -100,9 +100,13 @@ mcp_creds_for_tools() {
         echo "${agent_prefix}_gmail_pass"
     fi
     if [[ ",$tools," == *,myob,* ]]; then
+        # myob_refresh_token is intentionally NOT listed: per-user mode
+        # means each Telegram user runs their own OAuth dance, so the
+        # platform-level refresh token is optional. If the operator has
+        # set one anyway (legacy or admin-direct-mode), the existsSync
+        # filter below picks it up and includes it.
         echo "myob_client_id"
         echo "myob_client_secret"
-        echo "myob_refresh_token"
         echo "myob_business_id"
     fi
     if [[ ",$tools," == *,hikvision,* ]]; then
@@ -153,6 +157,28 @@ write_mcp_credentials_dropin() {
         # one. So filename, encrypted name, and runtime name must all match.
         echo "LoadCredentialEncrypted=${cred}:$CRED_VAULT/${cred}.cred"
     done < <(mcp_creds_for_tools "$name" "$tools")
+
+    # Optional creds — listed per tool, only emitted if their .cred file
+    # actually exists in the vault. Lets a tool declare credentials that
+    # are nice-to-have-but-not-required (e.g. myob_refresh_token, where
+    # per-user mode is the default and the platform token is just a
+    # convenience for direct/admin access). Without this filter, a
+    # missing optional cred file would block the unit from starting.
+    while IFS= read -r cred; do
+        [[ -n "$cred" ]] || continue
+        [[ -f "$CRED_VAULT/$cred.cred" ]] || continue
+        echo "LoadCredentialEncrypted=${cred}:$CRED_VAULT/${cred}.cred"
+    done < <(mcp_optional_creds_for_tools "$name" "$tools")
+}
+
+# Optional creds — only loaded if the operator chose to provide them.
+# Same shape as mcp_creds_for_tools (one cred name per line); the
+# filter in write_mcp_credentials_dropin drops missing entries.
+mcp_optional_creds_for_tools() {
+    local name="$1" tools="$2"
+    if [[ ",$tools," == *,myob,* ]]; then
+        echo "myob_refresh_token"
+    fi
 }
 
 # Drop-in to make agent@<name>.service start *after* its credential

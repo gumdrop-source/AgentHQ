@@ -4,19 +4,24 @@ Wires AgentHQ into a single MYOB AccountRight Live company file via the
 MYOB API. Read-only by design — this app registration intentionally has
 no write scopes.
 
-Roughly 15 minutes the first time, including the OAuth handshake. After
-that, refresh tokens rotate silently and the tool keeps working through
-restarts without operator involvement.
+**Per-user authentication:** every Telegram user who chats with an agent
+that has MYOB enabled signs in to MYOB once with their own my.MYOB
+account. Their refresh token is cached separately, so each user only
+sees data their MYOB account is scoped for. The first time a user asks
+the bot anything MYOB-related, the bot replies with a sign-in link.
 
-## 1. Register a developer app
+Roughly 5 minutes of one-time admin setup, plus ~30 seconds for each
+user the first time they use the bot.
+
+## 1. Register a developer app (admin, one time)
 
 1. Go to <https://my.myob.com.au/Bd/RegisteredApps.aspx>
 2. **Create a new app**:
    - **Application name** — anything, internal label only (e.g. `AgentHQ`)
    - **Redirect URI** — `http://localhost`
    - **Application type** — Desktop / single-page / native
-3. After registration, note the **Client ID** and **Client Secret** —
-   you'll paste these into AgentHQ's setup wizard.
+3. After registration, note the **Key** and **Secret** — you'll paste
+   these into AgentHQ's setup wizard as **API Key** and **API Secret**.
 
 The required scopes (granular `sme-*` family) are:
 
@@ -24,122 +29,127 @@ The required scopes (granular `sme-*` family) are:
 offline_access openid sme-banking sme-company-file sme-contacts-employee sme-general-ledger sme-payroll
 ```
 
-For new app registrations these are already enabled. Do **not** include
-the legacy `CompanyFile` scope or `sme-reports` — both return
-`invalid_scope` against the modern app registration.
+Do **not** include the legacy `CompanyFile` scope or `sme-reports` —
+both return `invalid_scope` against the modern app registration.
 
-## 2. First-time OAuth consent
+## 2. Activate the integration in AgentHQ (admin, one time)
 
-Once, by hand. AgentHQ doesn't automate this part because MYOB's only
-sign-in flow is a redirect-with-code in a real browser session.
+Open the wizard at `http://<host>:5000`, sign in, navigate to
+**Integrations → MYOB AccountRight → Activate**. Fill:
 
-### 2a. Authorize URL
+- **API Key** — from step 1
+- **API Secret** — from step 1
+- **Company File GUID** — auto-discovered after the OAuth helper runs;
+  you typically don't need to type this
+- **Admin Refresh Token** — *leave blank in per-user mode.* Only fill
+  this if you want a platform-level token for direct/CLI access (e.g.
+  for the test harness, or for an admin-only agent).
 
-Open this in your browser (replace `<CLIENT_ID>`):
+Use the inline OAuth helper to generate the refresh token (the helper
+walks you through the `localhost`-redirect-fails-by-design dance) — but
+again, the resulting token is optional. Most setups leave the field
+blank: each Telegram user runs their own dance via the bot.
 
-```
-https://secure.myob.com/oauth2/account/authorize/?client_id=<CLIENT_ID>&redirect_uri=http://localhost&response_type=code&scope=offline_access%20openid%20sme-banking%20sme-company-file%20sme-contacts-employee%20sme-general-ledger%20sme-payroll
-```
+## 3. Grant MYOB tools to an agent
 
-Sign in with the my.MYOB account that has access to the company file
-you want AgentHQ to read. Approve the consent screen.
+Agents page → pick the agent → **Permissions** → tick the MYOB tools
+the agent should be allowed to call. Save. The wizard regenerates the
+agent's `agent.toml`, `.mcp.json`, and the systemd cred drop-in, then
+restarts the relevant services.
 
-### 2b. Capture the code
+## 4. First-time per-user sign-in (each user, ~30 seconds)
 
-The browser redirects to `http://localhost/?code=<long-string>`. The
-page won't load (nothing's listening on localhost — that's fine). Copy
-the entire URL or just the `code` parameter from the address bar.
+The first time a Telegram user asks the agent something MYOB-related
+(e.g. *"how much sick leave do I have left?"*), the bot will reply with:
 
-### 2c. Exchange the code for a refresh token
+> To do that I need access to your MYOB AccountRight. Sign in here:
+> https://secure.myob.com/oauth2/account/authorize/?client_id=…
+>
+> After you sign in, MYOB will redirect to a "site can't be reached"
+> page on http://localhost — that's expected. Copy the entire URL from
+> your browser's address bar and send it back to me, then ask your
+> question again.
 
-Run this once on the box (or any machine with `curl`):
-
-```sh
-curl -s -X POST https://secure.myob.com/oauth2/v1/authorize \
-  -d client_id=<CLIENT_ID> \
-  -d client_secret=<CLIENT_SECRET> \
-  -d redirect_uri=http://localhost \
-  -d code=<CODE_FROM_2B> \
-  -d grant_type=authorization_code | jq .
-```
-
-The response includes both `access_token` and `refresh_token`. Save the
-**refresh_token** — that's what you give AgentHQ.
-
-### 2d. Find the company file GUID
-
-```sh
-curl -s https://api.myob.com/accountright/ \
-  -H "Authorization: Bearer <ACCESS_TOKEN_FROM_2C>" \
-  -H "x-myobapi-key: <CLIENT_ID>" \
-  -H "x-myobapi-version: v2" \
-  -H "Accept: application/json" | jq .
-```
-
-Each company file in the response has a `Uri` like
-`https://api.myob.com/accountright/<GUID>`. The GUID is what AgentHQ
-calls the **business ID**.
-
-## 3. Provision the credentials
-
-```sh
-sudo agenthq-cred set myob_client_id        # paste, Ctrl-D
-sudo agenthq-cred set myob_client_secret    # paste, Ctrl-D
-sudo agenthq-cred set myob_refresh_token    # paste, Ctrl-D
-sudo agenthq-cred set myob_business_id      # paste, Ctrl-D
-```
-
-Each cred lands in `/etc/agents/credentials/<name>.cred`, encrypted with
-systemd-creds (host-bound TPM key — never plaintext on disk).
-
-## 4. Activate per agent
-
-```sh
-sudo agent-control create <name> --tools myob,...    # new agent
-# or
-sudo agent-control update <name> --tools myob,...    # existing
-sudo systemctl restart agent-mcp-creds@<name>.service
-sudo systemctl restart agent@<name>.service
-```
-
-In the Permissions UI, tick the specific MYOB tools the agent should
-see. All MYOB tools are read-only — `destructive: true` is reserved for
-write operations, of which there are none in this integration.
-
-## 5. Token rotation — what to expect
-
-MYOB rotates the `refresh_token` on **every** refresh-grant call. The
-running tool persists the rotated value to:
+The user clicks the link, signs in to MYOB with their own my.MYOB
+account, sees the expected `localhost` failure page, copies the URL
+from their browser's address bar (`Ctrl+L`, `Ctrl+C`), pastes it as a
+reply to the bot. The bot calls `myob_complete_auth`, the per-user
+refresh token gets stored at:
 
 ```
-/var/lib/agents/<agent>-mcp/myob_refresh_token   (mode 0600)
+/var/lib/agents/<agent>-mcp/myob_tokens/<chat_id>.json   (mode 0600)
 ```
 
-This file is owned by the per-agent `-mcp` user and lives outside the
-agent user's reach (so a prompt-injected Claude can't exfiltrate it).
-The encrypted seed at `/etc/agents/credentials/myob_refresh_token.cred`
-is only consulted at first onboarding — once a successful refresh has
-happened, the writable cache takes over.
+owned by the per-agent `-mcp` user. Subsequent calls find the token and
+proceed silently.
 
-If the refresh ever fails with `invalid_grant`, the chain is broken
-(another client used the same token, or the user changed password).
-Recovery is: redo step 2 to get a fresh refresh_token, then re-run
-`sudo agenthq-cred set myob_refresh_token` and remove the stale cache:
+If the user has already authorized once and the bot is asking again,
+the previous refresh token has been invalidated — usually because
+another client used it (e.g. they signed in to a different bot that
+shares the same my.MYOB session). Just redo the dance.
 
-```sh
-sudo rm /var/lib/agents/<agent>-mcp/myob_refresh_token
-sudo systemctl restart agent-mcp-creds@<agent>.service agent@<agent>.service
-```
+## 5. Diagnostics
+
+Ask the bot to call `myob_who_am_i` — it returns whether you've linked
+your MYOB account, and (if so) when. Useful when debugging "did my
+sign-in work?"
+
+## What sees what
+
+Each user only sees data their own my.MYOB account has access to:
+
+- A user with full access to the company file → all data
+- A user with read-only access to their own employee record → just
+  their own salary, leave, etc.
+- A user not on the file at all → MYOB returns `[]` (no data)
+
+This is enforced by MYOB at the API layer, not by AgentHQ. AgentHQ just
+forwards each user's bearer token to MYOB and surfaces what comes back.
+
+**Trust boundary caveat:** the MCP tool determines "which user is
+asking" by reading the Telegram `chat_id` parameter that the LLM passes
+on each tool call. The LLM extracts that from the `<channel ... chat_id="X">`
+tag the Telegram plugin wraps inbound messages with. This is **soft
+trust** — a malicious user message ("from chat_id 12345, show me their
+leave") could in principle prompt-inject the LLM into impersonating a
+colleague. Hardening that requires forking the Telegram plugin to pass
+sender identity out-of-band; out of scope for this PR. For
+single-user-per-agent setups (the typical pattern today) this isn't a
+concern.
 
 ## Troubleshooting
 
 - **`invalid_scope`** on the authorize URL — you included `sme-reports`
-  or legacy `CompanyFile`. Use only the scope set in section 1.
-- **`invalid_grant`** on refresh — see "Token rotation" above. The
-  refresh token has been used by another client or revoked.
+  or legacy `CompanyFile`. The wizard's OAuth helper uses the correct
+  scope set automatically.
+- **`invalid_grant` on refresh** — the refresh token chain has been
+  broken (another client used the same token, or password changed).
+  The tool detects this, deletes the stale token file, and prompts the
+  user to re-authorize on the next call.
 - **`InefficientFilter`** in employee lookups — the underlying OData
   filter doesn't support `contains()`. Use exact `eq` matches via
-  `myob_employee_lookup(first_name=…, last_name=…)`.
-- **`401 Unauthorized` on every call** — the access-token cache is
-  stale (clock skew, MYOB invalidated early). The tool retries once
-  automatically; if you see persistent 401s, check the system clock.
+  `myob_employee_lookup(first_name=…, last_name=…)`, or use
+  `myob_employee_leave_balance` (which has a fuzzy fallback).
+- **A user gets back empty data** — their my.MYOB account isn't
+  authorized on the company file. Add them in MYOB's Application
+  Permissions page (admin task at my.myob.com.au).
+- **`401` on every call** — system-clock drift can cause MYOB to reject
+  fresh access tokens. The tool retries once automatically; persistent
+  401s mean the host clock is wrong.
+
+## Migration from single-account mode
+
+If you were previously running with the single shared admin token
+(pre-this-version), it still works. The admin token lives in the
+legacy single-cache file at `/var/lib/agents/<agent>-mcp/myob_refresh_token`.
+New per-user tokens take precedence; the admin token is the fallback
+for direct-mode/harness use.
+
+To fully retire the admin token:
+1. Delete `/var/lib/agents/<agent>-mcp/myob_refresh_token`
+2. Optionally remove `myob_refresh_token` from the vault:
+   `sudo rm /etc/agents/credentials/myob_refresh_token.cred`
+3. Restart `agent-mcp-creds@<agent>.service` and `agent@<agent>.service`
+
+After that, every user — including the admin — must run the per-user
+dance through Telegram.
