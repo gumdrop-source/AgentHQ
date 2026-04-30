@@ -33,48 +33,6 @@
   "tools": {
     "gigafy_portal_ping": {
       "description": "Connectivity sanity check — mints a fresh access token and reports who we authenticated as"
-    },
-    "gigafy_portal_invoice_blank": {
-      "description": "Get an empty purchase-invoice template (the JSON shape the Portal expects when creating)"
-    },
-    "gigafy_portal_invoice_load": {
-      "description": "Load a purchase invoice by GUID — useful to verify a creation"
-    },
-    "gigafy_portal_create_purchase_invoice": {
-      "description": "Create (PUT) a purchase invoice in the Portal — pass the JSON payload",
-      "destructive": true
-    },
-    "gigafy_portal_delete_purchase_invoice": {
-      "description": "Delete a purchase invoice by GUID — irreversible",
-      "destructive": true
-    },
-    "gigafy_portal_supplier_lookup": {
-      "description": "Search suppliers by name fragment — call before create to avoid duplicates"
-    },
-    "gigafy_portal_supplier_blank": {
-      "description": "Get an empty supplier template (the JSON shape the Portal expects when creating)"
-    },
-    "gigafy_portal_create_supplier": {
-      "description": "Create (PUT) a supplier in the Portal — pass the JSON payload",
-      "destructive": true
-    },
-    "gigafy_portal_inbox_list": {
-      "description": "List pending AP-invoice drafts in the Portal Inbox"
-    },
-    "gigafy_portal_inbox_load": {
-      "description": "Load an inbox draft by integer ID, plus reference data (suppliers, ledger accounts, tax groups, work orders, stock)"
-    },
-    "gigafy_portal_inbox_save": {
-      "description": "Create or update an AP-invoice draft in the Portal Inbox — flat shape, single line item",
-      "destructive": true
-    },
-    "gigafy_portal_inbox_raise": {
-      "description": "Convert an inbox draft into a real Purchase Invoice — the actual create step",
-      "destructive": true
-    },
-    "gigafy_portal_inbox_delete": {
-      "description": "Delete an inbox draft (reversible — you can re-create)",
-      "destructive": true
     }
   }
 }
