@@ -33,6 +33,30 @@
   "tools": {
     "gigafy_portal_ping": {
       "description": "Connectivity sanity check — mints a fresh access token and reports who we authenticated as"
+    },
+    "gigafy_portal_invoice_blank": {
+      "description": "Get an empty purchase-invoice template (the JSON shape the Portal expects when creating)"
+    },
+    "gigafy_portal_invoice_load": {
+      "description": "Load a purchase invoice by GUID — useful to verify a creation"
+    },
+    "gigafy_portal_create_purchase_invoice": {
+      "description": "Create (PUT) a purchase invoice in the Portal — pass the JSON payload",
+      "destructive": true
+    },
+    "gigafy_portal_delete_purchase_invoice": {
+      "description": "Delete a purchase invoice by GUID — irreversible",
+      "destructive": true
+    },
+    "gigafy_portal_supplier_lookup": {
+      "description": "Search suppliers by name fragment — call before create to avoid duplicates"
+    },
+    "gigafy_portal_supplier_blank": {
+      "description": "Get an empty supplier template (the JSON shape the Portal expects when creating)"
+    },
+    "gigafy_portal_create_supplier": {
+      "description": "Create (PUT) a supplier in the Portal — pass the JSON payload",
+      "destructive": true
     }
   }
 }

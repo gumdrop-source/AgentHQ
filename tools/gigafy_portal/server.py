@@ -13,6 +13,7 @@ service account, and the Telegram allowlist is the access boundary.
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -151,6 +152,53 @@ def _post(path: str, body: Any | None = None) -> Any:
     return r.json()
 
 
+def _put(path: str, body: Any | None = None) -> Any:
+    """PUT against the Portal API with a JSON body. Used for upsert
+    semantics — the API's invoice and supplier "save" endpoints are PUTs
+    where the body's entityId discriminates create-vs-update."""
+    _require_creds()
+    if not path.startswith("/"):
+        path = "/" + path
+    headers = {**_headers(), "Content-Type": "application/json"}
+    r = requests.put(f"{API_URL}{path}", headers=headers, json=body, timeout=30)
+    if r.status_code == 401:
+        global _cached_access_token_expires_at
+        with _token_lock:
+            _cached_access_token_expires_at = 0.0
+        headers = {**_headers(), "Content-Type": "application/json"}
+        r = requests.put(f"{API_URL}{path}", headers=headers, json=body, timeout=30)
+    if not r.ok:
+        body_txt = r.text[:500] if r.text else ""
+        raise RuntimeError(f"Portal PUT {path} failed ({r.status_code}): {body_txt}")
+    if not r.content:
+        return None
+    return r.json()
+
+
+def _delete(path: str) -> Any:
+    """DELETE against the Portal API."""
+    _require_creds()
+    if not path.startswith("/"):
+        path = "/" + path
+    r = requests.delete(f"{API_URL}{path}", headers=_headers(), timeout=30)
+    if r.status_code == 401:
+        global _cached_access_token_expires_at
+        with _token_lock:
+            _cached_access_token_expires_at = 0.0
+        r = requests.delete(f"{API_URL}{path}", headers=_headers(), timeout=30)
+    if not r.ok:
+        body_txt = r.text[:500] if r.text else ""
+        raise RuntimeError(f"Portal DELETE {path} failed ({r.status_code}): {body_txt}")
+    if not r.content:
+        return None
+    return r.json()
+
+
+# Sentinel "no entity" GUID — used as a path segment for "create new" PUT
+# routes (the API uses this rather than a separate /create endpoint).
+ZERO_GUID = "00000000-0000-0000-0000-000000000000"
+
+
 # ─── MCP server ────────────────────────────────────────────────────────────
 
 mcp = FastMCP(
@@ -190,6 +238,136 @@ def gigafy_portal_ping() -> dict:
         "access_token_prefix": token[:10] + "…" if token else None,
         "expires_in_seconds": ttl_remaining,
     }
+
+
+# ─── purchase invoices ─────────────────────────────────────────────────────
+
+@mcp.tool()
+def gigafy_portal_invoice_blank() -> dict:
+    """Get an empty purchase-invoice template for the configured reseller.
+
+    Returns the JSON shape the Portal expects when creating a new invoice
+    — the right field names, default values, and any required-but-empty
+    arrays. Always call this first before constructing a payload for
+    gigafy_portal_create_purchase_invoice; the schema is the source of
+    truth (this server doesn't bake in field assumptions).
+    """
+    _require_creds()
+    return _get(f"/api/Purchases/Invoices/{RESELLER_ID}/Blank")
+
+
+@mcp.tool()
+def gigafy_portal_invoice_load(entity_id: str) -> dict:
+    """Load a purchase invoice by its GUID.
+
+    Useful as a verification step after gigafy_portal_create_purchase_invoice —
+    confirm the saved record matches the intended payload.
+    """
+    if not entity_id:
+        raise ValueError("entity_id is required")
+    return _get(f"/api/Purchases/Invoices/{entity_id}")
+
+
+@mcp.tool()
+def gigafy_portal_create_purchase_invoice(invoice_json: str) -> dict:
+    """Create (or update) a purchase invoice in the Gigafy Management Portal.
+
+    DESTRUCTIVE — this writes to the live Portal. Always show the operator
+    the full JSON preview first and get explicit confirmation before calling.
+
+    Recommended pattern:
+      1. Call gigafy_portal_invoice_blank() to get the template
+      2. Fill fields from the source (image / PDF / email)
+      3. Reply to the user with a preview, ask "save?"
+      4. Only on explicit yes, call this tool with the JSON
+      5. Call gigafy_portal_invoice_load(returned_id) to verify
+
+    Args:
+        invoice_json: JSON-encoded invoice payload. Should match the shape
+            returned by gigafy_portal_invoice_blank — copy that template
+            and modify; don't construct from scratch.
+
+    Returns the saved invoice (including its newly assigned entityId).
+    """
+    try:
+        body = json.loads(invoice_json)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"invoice_json is not valid JSON: {e}") from e
+    if not isinstance(body, dict):
+        raise ValueError("invoice_json must encode a JSON object")
+    return _put("/api/Purchases/Invoices", body)
+
+
+@mcp.tool()
+def gigafy_portal_delete_purchase_invoice(entity_id: str) -> dict:
+    """Delete a purchase invoice by GUID.
+
+    DESTRUCTIVE — irreversible. Useful for undoing an incorrect creation
+    during testing. Always confirm with the operator before calling.
+    """
+    if not entity_id:
+        raise ValueError("entity_id is required")
+    return _delete(f"/api/Purchases/Invoices/{entity_id}")
+
+
+# ─── suppliers ─────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def gigafy_portal_supplier_lookup(query: str) -> Any:
+    """Look up suppliers by name fragment (case-insensitive).
+
+    Use this BEFORE gigafy_portal_create_supplier — many invoices come
+    from suppliers that already exist in the Portal, and creating a
+    duplicate makes a mess. If lookup returns at least one close match,
+    surface it to the operator before assuming "this vendor doesn't
+    exist yet".
+
+    Args:
+        query: Name fragment to search on. The Portal's lookup endpoint
+            does its own matching — typically substring on the supplier
+            name + display ID.
+    """
+    if not query:
+        raise ValueError("query is required")
+    return _get(f"/api/Suppliers/{RESELLER_ID}/Lookup", params={"query": query})
+
+
+@mcp.tool()
+def gigafy_portal_supplier_blank() -> dict:
+    """Get an empty supplier template for the configured reseller.
+
+    Same role as gigafy_portal_invoice_blank — returns the JSON shape the
+    Portal expects when creating a new supplier. Use as the starting
+    point for gigafy_portal_create_supplier.
+    """
+    _require_creds()
+    return _get(f"/api/Suppliers/{RESELLER_ID}/Blank")
+
+
+@mcp.tool()
+def gigafy_portal_create_supplier(supplier_json: str) -> dict:
+    """Create a new supplier in the Gigafy Management Portal.
+
+    DESTRUCTIVE. Before calling, ALWAYS check gigafy_portal_supplier_lookup
+    first to make sure the supplier doesn't already exist — duplicates
+    cause downstream chaos in invoicing and reconciliation. Show the
+    operator a preview and confirm before saving.
+
+    Args:
+        supplier_json: JSON-encoded supplier payload. Use the shape from
+            gigafy_portal_supplier_blank — modify, don't construct.
+
+    Returns the saved supplier (including its newly assigned entityId).
+    """
+    try:
+        body = json.loads(supplier_json)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"supplier_json is not valid JSON: {e}") from e
+    if not isinstance(body, dict):
+        raise ValueError("supplier_json must encode a JSON object")
+    # PUT route is /api/Suppliers/{entityId} — the zero GUID is the
+    # Portal's "create new" sentinel.
+    return _put(f"/api/Suppliers/{ZERO_GUID}", body)
 
 
 # ─── entry ─────────────────────────────────────────────────────────────────
