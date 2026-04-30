@@ -5,16 +5,16 @@
   "credentials": [
     {
       "key": "myob_client_id",
-      "label": "Client ID",
+      "label": "API Key",
       "env": "MYOB_CLIENT_ID",
-      "description": "From your MYOB API Portal app registration (developer.myob.com)."
+      "description": "Shown as 'Key' on your registered app at my.myob.com.au/Bd/RegisteredApps.aspx. (OAuth2 calls this the client_id.)"
     },
     {
       "key": "myob_client_secret",
-      "label": "Client Secret",
+      "label": "API Secret",
       "env": "MYOB_CLIENT_SECRET",
       "secret": true,
-      "description": "OAuth client secret paired with the Client ID."
+      "description": "Shown as 'Secret' on the same registered-app page. (OAuth2 calls this the client_secret.)"
     },
     {
       "key": "myob_refresh_token",
