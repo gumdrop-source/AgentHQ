@@ -732,36 +732,43 @@ function renderOAuthHelper(id: string, oauth: OAuthManifest): string {
            data-scope="${escapeHtml(oauth.scope)}"
            data-discovery="${escapeHtml(oauth.discovery ?? "")}">
         <div>
-          <h4 class="font-medium text-slate-900">Get a refresh token</h4>
-          <p class="text-xs text-slate-600 mt-1">The helper builds the authorize URL and runs the code-for-token exchange for you. Fill <strong>API Key</strong> and <strong>API Secret</strong> above first.</p>
+          <h4 class="font-medium text-slate-900">Authorize this integration</h4>
+          <p class="text-xs text-slate-600 mt-1" data-oauth-stage-help>Fill in <strong>API Key</strong> and <strong>API Secret</strong> above, then come back here.</p>
         </div>
-        <ol class="list-decimal list-inside text-sm text-slate-700 space-y-2">
-          <li>
-            <a href="#" data-oauth-authorize
-               class="pointer-events-none opacity-50 inline-flex items-center gap-1 px-3 py-1.5 rounded-lg font-medium text-sm bg-slate-900 text-white hover:bg-slate-700"
-               target="_blank" rel="noopener noreferrer">Authorize with provider →</a>
-            <span class="text-xs text-slate-500 ml-2" data-oauth-authorize-hint>(enter API Key first)</span>
-          </li>
-          <li>
-            Sign in &amp; approve. The browser will then try to load
-            <code class="px-1 rounded bg-white border border-slate-200 text-xs">${escapeHtml(oauth.redirect_uri)}/?code=…</code>
-            and show a "this site can't be reached" / "connection refused" error page.
-            <strong class="text-slate-900">That's expected</strong> — nothing is actually listening on that address. The browser address bar still contains the full redirect URL, which is what we need.
-          </li>
-          <li>
-            <strong>Copy the entire URL from the address bar</strong>
-            (click the address bar or press <kbd class="px-1 rounded bg-white border border-slate-200 text-xs">Ctrl</kbd>+<kbd class="px-1 rounded bg-white border border-slate-200 text-xs">L</kbd>, then <kbd class="px-1 rounded bg-white border border-slate-200 text-xs">Ctrl</kbd>+<kbd class="px-1 rounded bg-white border border-slate-200 text-xs">C</kbd>) and paste it below:
-          </li>
-        </ol>
-        <div class="flex gap-2">
-          <input data-oauth-redirect-input type="text" autocomplete="off" spellcheck="false"
-                 placeholder="${escapeHtml(oauth.redirect_uri)}/?code=..."
-                 class="flex-1 rounded-lg border border-slate-300 px-3 py-2 font-mono text-xs">
-          <button type="button" data-oauth-exchange
-                  class="px-3 py-2 rounded-lg font-medium text-sm bg-emerald-600 text-white hover:bg-emerald-500 disabled:opacity-50">
-            Get refresh token
-          </button>
+
+        <!-- Stage 1 — kick off the OAuth dance ─────────────────────────── -->
+        <div data-oauth-stage="1">
+          <a href="#" data-oauth-authorize
+             class="pointer-events-none opacity-50 block w-full text-center px-4 py-3 rounded-lg font-medium text-sm bg-slate-900 text-white hover:bg-slate-700"
+             target="_blank" rel="noopener noreferrer">Sign in with provider →</a>
+          <p class="text-xs text-slate-500 mt-2" data-oauth-authorize-hint>(enter API Key first to enable)</p>
         </div>
+
+        <!-- Stage 2 — paste the redirected URL back ────────────────────── -->
+        <div data-oauth-stage="2" class="hidden space-y-2">
+          <div class="rounded-lg bg-white border border-amber-300 p-3 text-xs text-slate-700 space-y-1">
+            <p class="font-medium text-slate-900">After you sign in, the browser will try to load <code class="px-1 rounded bg-slate-100">${escapeHtml(oauth.redirect_uri)}/?code=…</code> and show a "this site can't be reached" error.</p>
+            <p>That's expected — nothing is listening at that address. The address bar will still contain the full URL with the code we need.</p>
+            <p><strong>Copy the entire URL from the address bar</strong> (click the address bar, then <kbd class="px-1 rounded bg-slate-100 border border-slate-200">Ctrl</kbd>+<kbd class="px-1 rounded bg-slate-100 border border-slate-200">A</kbd>, <kbd class="px-1 rounded bg-slate-100 border border-slate-200">Ctrl</kbd>+<kbd class="px-1 rounded bg-slate-100 border border-slate-200">C</kbd>) and paste it below:</p>
+          </div>
+          <div class="flex gap-2">
+            <input data-oauth-redirect-input type="text" autocomplete="off" spellcheck="false"
+                   placeholder="${escapeHtml(oauth.redirect_uri)}/?code=..."
+                   class="flex-1 min-w-0 rounded-lg border border-slate-300 px-3 py-2 font-mono text-xs">
+            <button type="button" data-oauth-exchange
+                    class="shrink-0 px-3 py-2 rounded-lg font-medium text-sm bg-emerald-600 text-white hover:bg-emerald-500 disabled:opacity-50">
+              Continue
+            </button>
+          </div>
+        </div>
+
+        <!-- Stage 3 — discovery picker (only shown when >1 result) ──────── -->
+        <div data-oauth-stage="3" class="hidden space-y-2">
+          <label class="block text-sm font-medium text-slate-900" data-oauth-discovery-label>Choose:</label>
+          <select data-oauth-discovery-select required
+                  class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm bg-white"></select>
+        </div>
+
         <div data-oauth-status class="text-xs hidden"></div>
       </div>
       <script>
@@ -777,9 +784,23 @@ function renderOAuthHelper(id: string, oauth: OAuthManifest): string {
         const scope             = helper.dataset.scope;
         const authorizeBtn      = helper.querySelector('[data-oauth-authorize]');
         const authorizeHint     = helper.querySelector('[data-oauth-authorize-hint]');
+        const stageHelp         = helper.querySelector('[data-oauth-stage-help]');
+        const stage1            = helper.querySelector('[data-oauth-stage="1"]');
+        const stage2            = helper.querySelector('[data-oauth-stage="2"]');
+        const stage3            = helper.querySelector('[data-oauth-stage="3"]');
         const redirectInput     = helper.querySelector('[data-oauth-redirect-input]');
         const exchangeBtn       = helper.querySelector('[data-oauth-exchange]');
+        const discoverySelect   = helper.querySelector('[data-oauth-discovery-select]');
+        const discoveryLabel    = helper.querySelector('[data-oauth-discovery-label]');
         const statusEl          = helper.querySelector('[data-oauth-status]');
+
+        function showStage(n) {
+          [stage1, stage2, stage3].forEach((el, i) => {
+            if (!el) return;
+            if (i + 1 === n) el.classList.remove('hidden');
+            else el.classList.add('hidden');
+          });
+        }
 
         function buildAuthorizeUrl() {
           const cid = (clientIdInput && clientIdInput.value || '').trim();
@@ -794,15 +815,17 @@ function renderOAuthHelper(id: string, oauth: OAuthManifest): string {
         }
 
         function refreshAuthorizeBtn() {
+          const cid = (clientIdInput && clientIdInput.value || '').trim();
+          const csec = (clientSecretInput && clientSecretInput.value || '').trim();
           const url = buildAuthorizeUrl();
-          if (url) {
+          if (url && csec) {
             authorizeBtn.href = url;
             authorizeBtn.classList.remove('pointer-events-none', 'opacity-50');
-            authorizeHint.textContent = '(opens the provider in a new tab)';
+            authorizeHint.textContent = 'Opens the provider in a new tab. Come back here once you see the "site can\\'t be reached" error.';
           } else {
             authorizeBtn.removeAttribute('href');
             authorizeBtn.classList.add('pointer-events-none', 'opacity-50');
-            authorizeHint.textContent = '(enter API Key first)';
+            authorizeHint.textContent = url ? '(enter API Secret first to enable)' : '(enter API Key first to enable)';
           }
         }
 
@@ -815,32 +838,32 @@ function renderOAuthHelper(id: string, oauth: OAuthManifest): string {
           statusEl.textContent = text;
         }
 
-        function replaceWithSelect(targetField, options) {
-          const targetInput = document.getElementById('cred-' + targetField);
-          if (!targetInput) return;
-          const select = document.createElement('select');
-          select.id = targetInput.id;
-          select.name = targetInput.name;
-          select.required = true;
-          select.className = targetInput.className;
-          for (const opt of options) {
-            const o = document.createElement('option');
-            o.value = opt.value;
-            o.textContent = opt.label;
-            select.appendChild(o);
-          }
-          targetInput.replaceWith(select);
+        function clearStatus() { statusEl.classList.add('hidden'); statusEl.textContent = ''; }
+
+        function setHiddenValue(fieldName, value) {
+          const el = document.getElementById('cred-' + fieldName);
+          if (el) el.value = value;
         }
 
         if (clientIdInput) clientIdInput.addEventListener('input', refreshAuthorizeBtn);
+        if (clientSecretInput) clientSecretInput.addEventListener('input', refreshAuthorizeBtn);
         refreshAuthorizeBtn();
+
+        // Reveal the paste-redirect-URL stage once the user actually clicks
+        // the authorize link. Doing it on click means we don't show the
+        // confusing paste box before the user even sees the provider screen.
+        if (authorizeBtn) authorizeBtn.addEventListener('click', () => {
+          if (authorizeBtn.classList.contains('pointer-events-none')) return;
+          showStage(2);
+          stageHelp.innerHTML = 'After you sign in, copy the URL from the failed-page address bar and paste it below.';
+        });
 
         if (exchangeBtn) exchangeBtn.addEventListener('click', async () => {
           const url = (redirectInput.value || '').trim();
           const cid = (clientIdInput && clientIdInput.value || '').trim();
           const csec = (clientSecretInput && clientSecretInput.value || '').trim();
           if (!url) { setStatus('error', 'Paste the redirect URL first.'); return; }
-          if (!cid || !csec) { setStatus('error', 'Fill API Key and API Secret above first.'); return; }
+          if (!cid || !csec) { setStatus('error', 'API Key / Secret above are missing.'); return; }
           exchangeBtn.disabled = true;
           setStatus('info', 'Exchanging code for refresh token…');
           try {
@@ -856,10 +879,48 @@ function renderOAuthHelper(id: string, oauth: OAuthManifest): string {
               return;
             }
             if (refreshInput) refreshInput.value = data.refresh_token;
-            if (data.discovery_options && data.discovery_target_field) {
-              replaceWithSelect(data.discovery_target_field, data.discovery_options);
+
+            const opts = data.discovery_options || [];
+            const target = data.discovery_target_field;
+            if (target && opts.length === 1) {
+              // Exactly one match — silently auto-fill, no UI noise.
+              setHiddenValue(target, opts[0].value);
+              showStage(0);
+              stageHelp.innerHTML = '<span class="text-emerald-700 font-medium">✓ Authorized.</span> Click <strong>Activate</strong> below to save.';
+              clearStatus();
+            } else if (target && opts.length > 1) {
+              // Multiple matches — let the user pick.
+              discoveryLabel.textContent = 'Multiple options were discovered — choose one:';
+              discoverySelect.innerHTML = '';
+              for (const opt of opts) {
+                const o = document.createElement('option');
+                o.value = opt.value;
+                o.textContent = opt.label;
+                discoverySelect.appendChild(o);
+              }
+              setHiddenValue(target, discoverySelect.value);
+              discoverySelect.addEventListener('change', () => setHiddenValue(target, discoverySelect.value));
+              showStage(3);
+              stageHelp.innerHTML = '<span class="text-emerald-700 font-medium">✓ Authorized.</span> Pick the right option, then click <strong>Activate</strong> below.';
+              clearStatus();
+            } else if (target && opts.length === 0) {
+              // Discovery declared but returned nothing — surface the
+              // hidden field so the operator can type the value by hand.
+              showStage(0);
+              const wrapper = document.querySelector('[data-cred="' + target + '"]');
+              const input   = document.getElementById('cred-' + target);
+              if (wrapper) wrapper.classList.remove('hidden');
+              if (input)  { input.type = 'text'; input.required = true; }
+              stageHelp.innerHTML = '<span class="text-amber-700 font-medium">Authorized,</span> but auto-discovery returned no options — please fill the remaining field by hand and click Activate.';
+              clearStatus();
+            } else {
+              // Manifest declares no discovery — only the refresh_token
+              // was hidden, and it's now populated. Operator just clicks
+              // Activate.
+              showStage(0);
+              stageHelp.innerHTML = '<span class="text-emerald-700 font-medium">✓ Authorized.</span> Click <strong>Activate</strong> below to save.';
+              clearStatus();
             }
-            setStatus('success', 'Refresh token saved. Review the form below and click Activate.');
           } catch (e) {
             setStatus('error', String(e));
             exchangeBtn.disabled = false;
@@ -878,17 +939,27 @@ app.get("/integrations/:id/activate", (c) => {
     const discoveryTarget = oauth ? discoveryTargetField(oauth, m) : undefined;
     const credFields = (m.credentials ?? []).map((cred: any) => {
         // Refresh-token + discovery-target fields are JS-populated by the
-        // OAuth helper, so we don't mark them `required` (the form still
-        // posts their values on submit). Without this the browser would
-        // refuse to submit the form before the user has run the helper.
+        // OAuth helper, so we render them as hidden inputs the operator
+        // never sees. They still post on submit. The discovery-target
+        // wrapper carries data-cred so the JS can re-surface it as a
+        // visible input if discovery returns zero options.
         const isAutoFilled = !!oauth && (
             cred.key === oauth.refresh_token_field ||
             (!!discoveryTarget && cred.key === discoveryTarget)
         );
+        if (isAutoFilled) {
+            return `
+        <div data-cred="${escapeHtml(cred.key)}" class="hidden">
+          <label class="block text-sm font-medium mb-1">${escapeHtml(cred.label ?? cred.key)}</label>
+          <input id="cred-${escapeHtml(cred.key)}" name="${escapeHtml(cred.key)}"
+                 type="hidden">
+        </div>
+    `;
+        }
         return `
         <div data-cred="${escapeHtml(cred.key)}">
-          <label class="block text-sm font-medium mb-1">${escapeHtml(cred.label ?? cred.key)}${cred.secret ? " <span class='text-xs text-slate-400 font-normal'>(secret)</span>" : ""}${isAutoFilled ? " <span class='text-xs text-emerald-600 font-normal'>(auto-filled by OAuth helper)</span>" : ""}</label>
-          <input id="cred-${escapeHtml(cred.key)}" name="${escapeHtml(cred.key)}" ${isAutoFilled ? "" : "required"}
+          <label class="block text-sm font-medium mb-1">${escapeHtml(cred.label ?? cred.key)}${cred.secret ? " <span class='text-xs text-slate-400 font-normal'>(secret)</span>" : ""}</label>
+          <input id="cred-${escapeHtml(cred.key)}" name="${escapeHtml(cred.key)}" required
                  ${cred.secret ? 'type="password" autocomplete="new-password"' : 'type="text" autocomplete="off"'}
                  spellcheck="false" autocapitalize="off" autocorrect="off"
                  data-1p-ignore data-lpignore="true" data-bwignore="true"
