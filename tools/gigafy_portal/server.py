@@ -14,9 +14,11 @@ service account, and the Telegram allowlist is the access boundary.
 from __future__ import annotations
 
 import json
+import mimetypes
 import os
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -129,6 +131,43 @@ def _get(path: str, params: dict[str, Any] | None = None) -> Any:
     if not r.content:
         return None
     return r.json()
+
+
+def _post_multipart(path: str, file_path: str, field: str = "files") -> Any:
+    """POST a single file to the Portal API as multipart/form-data.
+
+    Used by the attachment upload endpoint, which expects a plain
+    multipart upload with field name `files` (the API reads only the
+    first content from the multipart envelope). Don't set
+    Content-Type — requests fills it with the boundary string.
+    """
+    _require_creds()
+    if not path.startswith("/"):
+        path = "/" + path
+    p = Path(file_path)
+    if not p.exists() or not p.is_file():
+        raise ValueError(f"file not found or not a regular file: {file_path}")
+    mime = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+    with p.open("rb") as fh:
+        files = {field: (p.name, fh, mime)}
+        r = requests.post(f"{API_URL}{path}", headers=_headers(), files=files, timeout=120)
+        if r.status_code == 401:
+            global _cached_access_token_expires_at
+            with _token_lock:
+                _cached_access_token_expires_at = 0.0
+            fh.seek(0)
+            files = {field: (p.name, fh, mime)}
+            r = requests.post(f"{API_URL}{path}", headers=_headers(), files=files, timeout=120)
+    if not r.ok:
+        body_txt = r.text[:500] if r.text else ""
+        raise RuntimeError(f"Portal multipart POST {path} failed ({r.status_code}): {body_txt}")
+    if not r.content:
+        return None
+    # Endpoint returns either a JSON value or a bare string (filename).
+    try:
+        return r.json()
+    except ValueError:
+        return r.text
 
 
 def _post(path: str, body: Any | None = None) -> Any:
@@ -369,6 +408,44 @@ def gigafy_portal_invoice_load(entity_id: str) -> dict:
     if not entity_id:
         raise ValueError("entity_id is required")
     return _get(f"/api/Purchases/Invoices/{entity_id}")
+
+
+@mcp.tool()
+def gigafy_portal_invoice_attach(invoice_entity_id: str, file_path: str) -> Any:
+    """Attach a file (PDF / image / doc) to an existing purchase invoice.
+
+    Use after a successful gigafy_portal_create_purchase_invoice to
+    upload the source artefact (e.g. the original Telegram image, or
+    the PDF the invoice was parsed from). The file lands in Azure blob
+    storage and shows in the GMP UI's invoice attachment strip.
+
+    Args:
+        invoice_entity_id: GUID of the purchase invoice to attach to
+            (the entityId you used / received from create).
+        file_path: Absolute path to the file on disk, readable by the
+            -mcp user this tool runs as. Telegram-uploaded images
+            arrive at /home/<agent>/.claude/channels/telegram/inbox/
+            but that directory is NOT readable by the -mcp peer (the
+            agent's .claude/ tree is mode 0700). Before calling this
+            tool, copy the file into /tmp first with mode 0644:
+
+              cp /home/<agent>/.claude/channels/telegram/inbox/<file>  /tmp/<file>
+              chmod 0644 /tmp/<file>
+
+            Then pass `/tmp/<file>` here.
+
+    Returns the server-issued filename (looks like
+    `<attachment-entity-id>.<ext>`); the entity-id portion is what you'd
+    pass to a delete call.
+    """
+    if not invoice_entity_id:
+        raise ValueError("invoice_entity_id is required")
+    if not file_path:
+        raise ValueError("file_path is required")
+    return _post_multipart(
+        f"/api/Purchases/Invoices/{invoice_entity_id}/Attach/{RESELLER_ID}",
+        file_path,
+    )
 
 
 @mcp.tool()

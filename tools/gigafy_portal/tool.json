@@ -61,6 +61,10 @@
     "gigafy_portal_create_purchase_invoice": {
       "description": "Create a purchase invoice (PUT /Invoices) — flat header with stringified items array",
       "destructive": true
+    },
+    "gigafy_portal_invoice_attach": {
+      "description": "Attach a file (PDF / image / doc) to an existing purchase invoice — multipart upload",
+      "destructive": true
     }
   }
 }
