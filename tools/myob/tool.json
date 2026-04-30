@@ -40,7 +40,8 @@
     "client_id_field": "myob_client_id",
     "client_secret_field": "myob_client_secret",
     "refresh_token_field": "myob_refresh_token",
-    "discovery": "myob_company_files"
+    "discovery": "myob_company_files",
+    "discovery_fallback_help": "<p>Open your company file in the AccountRight browser at <a class=\"underline text-blue-700\" target=\"_blank\" rel=\"noopener noreferrer\" href=\"https://app.myob.com\">app.myob.com</a>. Once the file is open, your browser URL looks like:</p><pre class=\"mt-1 px-2 py-1 bg-white border border-slate-200 rounded text-xs font-mono whitespace-pre-wrap break-all\">https://app.myob.com/#/au/&lt;COMPANY-FILE-GUID&gt;/dashboard</pre><p class=\"mt-1\">Copy the long string between <code class=\"px-1 bg-white border border-slate-200 rounded text-xs\">/au/</code> and <code class=\"px-1 bg-white border border-slate-200 rounded text-xs\">/dashboard</code> and paste it below.</p>"
   },
   "tools": {
     "myob_complete_auth": {

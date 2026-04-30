@@ -710,6 +710,11 @@ type OAuthManifest = {
     client_secret_field: string;
     refresh_token_field: string;
     discovery?: string;
+    // Optional HTML snippet shown to the operator when discovery returns
+    // zero results — should explain how to find the value by hand.
+    // Lives in the manifest because it's tool-specific (where to find the
+    // company file GUID isn't transferable to other OAuth integrations).
+    discovery_fallback_help?: string;
 };
 
 // Returns the credential key whose value will be auto-filled by the
@@ -756,7 +761,8 @@ function renderOAuthHelper(id: string, oauth: OAuthManifest, m: any): string {
            data-redirect-uri="${escapeHtml(oauth.redirect_uri)}"
            data-scope="${escapeHtml(oauth.scope)}"
            data-discovery="${escapeHtml(oauth.discovery ?? "")}"
-           data-discovery-only="${discoveryOnly ? "true" : "false"}">
+           data-discovery-only="${discoveryOnly ? "true" : "false"}"
+           data-discovery-fallback-help="${escapeHtml(oauth.discovery_fallback_help ?? "")}">
         <div>
           <h4 class="font-medium text-slate-900">${escapeHtml(helperTitle)}</h4>
           <p class="text-xs text-slate-600 mt-1" data-oauth-stage-help>${helperSubtitle}</p>
@@ -938,8 +944,14 @@ function renderOAuthHelper(id: string, oauth: OAuthManifest, m: any): string {
               const wrapper = document.querySelector('[data-cred="' + target + '"]');
               const input   = document.getElementById('cred-' + target);
               if (wrapper) wrapper.classList.remove('hidden');
-              if (input)  { input.type = 'text'; input.required = true; }
-              stageHelp.innerHTML = '<span class="text-amber-700 font-medium">Auto-discovery returned no options.</span> Please fill the remaining field by hand and click Activate.';
+              if (input)  { input.type = 'text'; input.required = true; input.focus(); }
+              const fallbackHelp = helper.dataset.discoveryFallbackHelp || '';
+              const helpBlock = fallbackHelp
+                ? '<div class="mt-2 rounded-lg bg-white border border-amber-300 p-3 text-xs text-slate-700 space-y-1">' + fallbackHelp + '</div>'
+                : '';
+              stageHelp.innerHTML =
+                '<span class="text-amber-700 font-medium">Auto-discovery returned no options</span> — please fill the remaining field by hand and click Activate.'
+                + helpBlock;
               clearStatus();
             } else {
               // Manifest declares no discovery — only the refresh_token
@@ -977,11 +989,20 @@ app.get("/integrations/:id/activate", (c) => {
         // the JS can re-surface them if discovery returns zero options.
         const isAutoFilled = !!oauth && !!discoveryTarget && cred.key === discoveryTarget;
         if (isAutoFilled) {
+            // Same template as a regular field, just wrapped in a hidden
+            // div + initial type=hidden. When discovery fails the JS
+            // un-hides the wrapper and flips type back to text — matching
+            // styling means the re-surfaced input is visually identical
+            // to the API Key / API Secret inputs above it.
             return `
         <div data-cred="${escapeHtml(cred.key)}" class="hidden">
           <label class="block text-sm font-medium mb-1">${escapeHtml(cred.label ?? cred.key)}</label>
           <input id="cred-${escapeHtml(cred.key)}" name="${escapeHtml(cred.key)}"
-                 type="hidden">
+                 type="hidden"
+                 spellcheck="false" autocapitalize="off" autocorrect="off"
+                 data-1p-ignore data-lpignore="true" data-bwignore="true"
+                 class="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm">
+          ${cred.description ? `<p class="text-xs text-slate-500 mt-1">${escapeHtml(cred.description)}</p>` : ""}
         </div>
     `;
         }
