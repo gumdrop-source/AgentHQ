@@ -34,17 +34,23 @@ user the first time they use the bot (sign in, pick an org).
 The full scope string the tool requests is:
 
 ```
-offline_access accounting.contacts accounting.transactions accounting.settings accounting.reports.read
+offline_access accounting.contacts.read accounting.invoices.read accounting.settings.read accounting.reports.profitandloss.read
 ```
 
-These are the **broad** scopes — they grant read AND write capability
-on contacts/transactions/settings. The tool itself only ever makes
-GET calls (read-only by code), but the underlying token could in
-principle write. We use the broad scopes because the granular `.read`
-flavors (`accounting.contacts.read` etc.) require an opt-in that
-fresh Web-app registrations don't get by default — requesting them
-yields `unauthorized_client / Invalid scope for client` at Xero's
-authorize endpoint.
+These are the **granular read-only** scopes — required for any Xero
+app registered on or after 2026-03-02, when Xero's Developer Portal
+flipped the default away from the broad scopes. Post-cutoff apps
+reject `accounting.transactions` / `accounting.contacts` /
+`accounting.settings` with `unauthorized_client / Invalid scope for
+client` at the authorize endpoint, even though those scopes still
+appear in older sample apps.
+
+If you're activating against a pre-2026-03-02 app, swap `OAUTH_SCOPE`
+in `tools/xero/server.py` to the broad form:
+
+```
+offline_access accounting.contacts accounting.transactions accounting.settings accounting.reports.read
+```
 
 ## 2. Activate the integration in AgentHQ (admin, one time)
 
@@ -149,12 +155,15 @@ See `tools/myob/setup.md` for the longer note.
   the stale token + active-org files, and prompts the user to
   re-authorize on the next call.
 - **`unauthorized_client / Invalid scope for client`** at the Xero
-  sign-in page — at least one requested scope isn't enabled for your
-  app. The tool ships the broad scopes by default (which work for
-  every Web-app registration); if you've customised `OAUTH_SCOPE` to
-  use granular `.read` flavors and hit this, revert to the broad
-  scopes or contact Xero support to enable the granular set on your
-  app.
+  sign-in page — the requested scopes don't match what the app
+  registration permits. As of 2026-03-02 Xero requires *granular*
+  scopes on new apps and rejects the legacy broad ones; pre-cutoff
+  apps still use the broad ones and reject the granular `.read`
+  variants. The tool ships granular by default (matches new apps);
+  for an older app, swap `OAUTH_SCOPE` in `tools/xero/server.py` to
+  the broad form (see the comment above `OAUTH_SCOPE`). If neither
+  works, the app's scope checklist in Developer Portal → your app →
+  Configuration may need scopes ticked explicitly.
 - **`org_required` payload returned even though the user just picked
   one** — the user's previously-picked tenant is no longer in
   `/connections` (org owner revoked the connection in Xero settings).

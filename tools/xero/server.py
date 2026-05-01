@@ -59,18 +59,28 @@ LEGACY_REFRESH_TOKEN_FILE = HOME / "xero_refresh_token"
 OAUTH_AUTHORIZE_URL = "https://login.xero.com/identity/connect/authorize"
 OAUTH_TOKEN_URL = "https://identity.xero.com/connect/token"
 OAUTH_REDIRECT_URI = "http://localhost"
-# Broad scopes. The granular `.read` flavors (accounting.contacts.read etc)
-# require an opt-in that Web-app registrations don't get by default —
-# requesting them yields "unauthorized_client / Invalid scope for client"
-# at the authorize endpoint. The broad scopes have been available for every
-# OAuth2 app since 2020, so they're the safe default. Token has write
-# capability but our tool code only ever calls GETs.
+# Granular read-only scopes. Required for any Xero app registered after
+# 2026-03-02 — the Developer Portal flipped the default at that cutoff,
+# and post-cutoff apps reject the broad scopes (`accounting.transactions`,
+# `accounting.contacts`, `accounting.settings`) with "unauthorized_client
+# / Invalid scope for client" at the authorize endpoint.
+#
+#   accounting.invoices.read   — Invoices endpoint (covers both ACCREC/AR
+#                                and ACCPAY/AP, gated by Type filter)
+#   accounting.contacts.read   — Contacts endpoint (customers + suppliers)
+#   accounting.settings.read   — Organisation, Accounts (chart of accounts)
+#   accounting.reports.profitandloss.read — /Reports/ProfitAndLoss
+#
+# If you have an older (pre-2026-03-02) app and want to keep using broad
+# scopes, swap this to:
+#   offline_access accounting.contacts accounting.transactions
+#   accounting.settings accounting.reports.read
 OAUTH_SCOPE = (
     "offline_access "
-    "accounting.contacts "
-    "accounting.transactions "
-    "accounting.settings "
-    "accounting.reports.read"
+    "accounting.contacts.read "
+    "accounting.invoices.read "
+    "accounting.settings.read "
+    "accounting.reports.profitandloss.read"
 )
 
 CONNECTIONS_URL = "https://api.xero.com/connections"
