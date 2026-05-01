@@ -1,0 +1,61 @@
+{
+  "name": "tanda",
+  "title": "Tanda Workforce",
+  "description": "Read-only access to Tanda (workforce management): rosters/schedules, timesheets, leave requests and balances, and employee directory. Each user authenticates against their own Tanda account on first use, so queries return only data their Tanda account is scoped for.",
+  "credentials": [
+    {
+      "key": "tanda_client_id",
+      "label": "Application ID",
+      "env": "TANDA_CLIENT_ID",
+      "description": "Shown as 'Application ID' on your registered app at my.tanda.co (Settings → API → Applications). (OAuth2 calls this the client_id.)"
+    },
+    {
+      "key": "tanda_client_secret",
+      "label": "Application Secret",
+      "env": "TANDA_CLIENT_SECRET",
+      "secret": true,
+      "description": "Shown as 'Secret' on the same registered-app page. (OAuth2 calls this the client_secret.)"
+    },
+    {
+      "key": "tanda_refresh_token",
+      "label": "Admin Refresh Token",
+      "env": "TANDA_REFRESH_TOKEN",
+      "secret": true,
+      "optional": true,
+      "hidden": true,
+      "description": "Not surfaced in the wizard. Each Telegram user runs their own sign-in dance the first time they ask the bot anything Tanda-related — no platform-level token needed. Admins who want a platform token for direct/CLI use can set it via `sudo agenthq-cred set tanda_refresh_token`."
+    }
+  ],
+  "tools": {
+    "tanda_complete_auth": {
+      "description": "Finish the per-user OAuth dance — pass the redirect URL the user copied back from their browser"
+    },
+    "tanda_who_am_i": {
+      "description": "Diagnostic: report whether the calling user has linked their Tanda account"
+    },
+    "tanda_me": {
+      "description": "Sanity check + identity of the linked Tanda user (name, email, employee record id)"
+    },
+    "tanda_user_lookup": {
+      "description": "Find employees by name or email — resolves a person into their Tanda user_id"
+    },
+    "tanda_roster": {
+      "description": "Roster / schedule entries between two dates — optionally filter to specific user_ids"
+    },
+    "tanda_timesheets": {
+      "description": "Timesheet entries (clock-ins / shifts worked) for one date — what people actually did, vs. what they were rostered for"
+    },
+    "tanda_leave_requests": {
+      "description": "Leave requests overlapping a date range — optionally filter to specific user_ids"
+    },
+    "tanda_leave_balance": {
+      "description": "Leave balances for one user by user_id (annual leave, personal/sick, long-service, etc., in hours)"
+    },
+    "tanda_my_leave_balance": {
+      "description": "Convenience: leave balances for the currently authenticated Tanda user — answers 'how much leave do I have left?'"
+    },
+    "tanda_raw_get": {
+      "description": "Escape hatch: GET an arbitrary Tanda v2 API path with optional query params"
+    }
+  }
+}
