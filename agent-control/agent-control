@@ -116,6 +116,11 @@ mcp_creds_for_tools() {
     if [[ ",$tools," == *,homeassistant,* ]] || [[ ",$tools," == *,ha,* ]]; then
         echo "ha_token"
     fi
+    if [[ ",$tools," == *,gigafy_portal,* ]]; then
+        echo "portal_api_user"
+        echo "portal_api_pass"
+        echo "portal_reseller_id"
+    fi
 }
 
 # Drop-in for agent@<name>.service.d/. The agent unit only needs the
@@ -178,6 +183,9 @@ mcp_optional_creds_for_tools() {
     local name="$1" tools="$2"
     if [[ ",$tools," == *,myob,* ]]; then
         echo "myob_refresh_token"
+    fi
+    if [[ ",$tools," == *,gigafy_portal,* ]]; then
+        echo "portal_api_url"
     fi
 }
 

@@ -1,0 +1,76 @@
+{
+  "name": "gigafy_portal",
+  "title": "Gigafy Management Portal",
+  "description": "Read-only access to manage.gigafy.com.au via the Hotspot Login Services API. Sales orders, quotes, BOM lookups. Single shared service-account auth (transitional — Cameron's per-user OAuth + delegation will replace this).",
+  "credentials": [
+    {
+      "key": "portal_api_user",
+      "label": "Service account username",
+      "env": "PORTAL_API_USER",
+      "description": "Username of the dedicated service account that AgentHQ uses to query the Portal."
+    },
+    {
+      "key": "portal_api_pass",
+      "label": "Service account password",
+      "env": "PORTAL_API_PASS",
+      "secret": true,
+      "description": "Encrypted at rest in the systemd-creds vault. Never visible to the LLM or to the agent user — only the trusted -mcp peer can decrypt it. Rotate via `sudo agenthq-cred set portal_api_pass`."
+    },
+    {
+      "key": "portal_reseller_id",
+      "label": "Reseller GUID",
+      "env": "PORTAL_RESELLER_ID",
+      "description": "Gigafy's reseller GUID — used as a path segment in the Sales Orders search endpoint."
+    },
+    {
+      "key": "portal_api_url",
+      "label": "API URL",
+      "env": "PORTAL_API_URL",
+      "optional": true,
+      "description": "Defaults to https://au.api.hotspotlogin.services. Override only if you're pointing at a staging environment."
+    }
+  ],
+  "tools": {
+    "gigafy_portal_ping": {
+      "description": "Connectivity sanity check — mints a fresh access token and reports who we authenticated as"
+    },
+    "gigafy_portal_supplier_lookup": {
+      "description": "Find suppliers by name fragment — resolves a vendor name into the supplierEntityId GUID"
+    },
+    "gigafy_portal_stock_lookup": {
+      "description": "Find stock / catalogue items by name or code — resolves stockEntityId for a line item"
+    },
+    "gigafy_portal_account_lookup": {
+      "description": "Find chart-of-accounts ledger accounts by name or code — resolves coaEntityId / coaCode for a line item"
+    },
+    "gigafy_portal_tax_group_list": {
+      "description": "List every tax group on the reseller — used to pick taxGroupEntityId (typically GST or N-T)"
+    },
+    "gigafy_portal_work_order_lookup": {
+      "description": "Find a work order / job ticket by free-text — optional, only used when attributing a cost to a job"
+    },
+    "gigafy_portal_invoice_blank": {
+      "description": "Empty purchase-invoice template — the JSON skeleton the Portal expects when creating"
+    },
+    "gigafy_portal_invoice_history": {
+      "description": "Recent invoices from one supplier — for learning prior coding before composing a new invoice"
+    },
+    "gigafy_portal_invoice_load": {
+      "description": "Load a purchase invoice by GUID — full record including line items and attachments"
+    },
+    "gigafy_portal_create_purchase_invoice": {
+      "description": "Create a purchase invoice (PUT /Invoices) — flat header with stringified items array",
+      "destructive": true
+    },
+    "gigafy_portal_invoice_attach": {
+      "description": "Attach a file (PDF / image / doc) to an existing purchase invoice — multipart upload",
+      "destructive": true
+    },
+    "gigafy_portal_ledger_for_account": {
+      "description": "Ledger entries for one chart-of-accounts account over a date range — optional journal_filter (PJ/SJ/GJ/...) for purchase-only / sales-only views"
+    },
+    "gigafy_portal_ledger_for_accounts": {
+      "description": "Multi-account ledger roll-up — fan out across a list of GUIDs, return combined entries plus per-account totals"
+    }
+  }
+}
