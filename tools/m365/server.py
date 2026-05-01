@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import functools
 import json
+import mimetypes
 import os
 import subprocess
 from pathlib import Path
@@ -292,6 +293,145 @@ def _graph_get_bytes(path: str) -> tuple[bytes, str]:
     return r.content, r.headers.get("Content-Type", "application/octet-stream")
 
 
+# ─── attachments ────────────────────────────────────────────────────────────
+
+# Graph caps inline attachment bytes at 3 MB per item; anything larger has to
+# go through createUploadSession + chunked PUT. We split on this boundary
+# transparently so the caller doesn't have to think about it.
+ATTACHMENT_INLINE_MAX_BYTES = 3 * 1024 * 1024
+
+# Chunk size for the resumable upload session. 5 MiB is well within Graph's
+# stated 60 MiB ceiling, big enough to keep round-trips reasonable on a 10 MB
+# xlsx, and aligned to 320 KiB (Graph requires multiples of 320 KiB except
+# for the final chunk).
+ATTACHMENT_CHUNK_BYTES = 5 * 1024 * 1024
+
+
+def _resolve_attachment(att: dict) -> tuple[str, bytes, str]:
+    """Materialize one attachment spec into (name, raw_bytes, content_type).
+
+    Accepts either:
+      - {"path": "/abs/path/file.xlsx", "name"?, "content_type"?}
+      - {"name": "file.xlsx", "content_bytes": "<base64>", "content_type"?}
+
+    `path` is preferred when the file is already on disk in the agent's
+    sandbox — saves round-tripping bytes through the LLM. `content_bytes`
+    is for files the LLM has materialized inline (e.g. generated CSV).
+    """
+    if not isinstance(att, dict):
+        raise ValueError(f"attachment must be an object, got {type(att).__name__}")
+
+    name = att.get("name")
+    content_type = att.get("content_type") or att.get("contentType")
+
+    if att.get("path"):
+        p = Path(att["path"])
+        if not p.is_file():
+            raise ValueError(f"attachment path not a file: {att['path']}")
+        raw = p.read_bytes()
+        if not name:
+            name = p.name
+        if not content_type:
+            content_type = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+        return name, raw, content_type
+
+    cb = att.get("content_bytes") or att.get("contentBytes")
+    if cb:
+        if not name:
+            raise ValueError("attachment with content_bytes requires `name`.")
+        try:
+            raw = base64.b64decode(cb, validate=True)
+        except Exception as e:
+            raise ValueError(f"attachment content_bytes is not valid base64: {e}") from e
+        if not content_type:
+            content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        return name, raw, content_type
+
+    raise ValueError("attachment must have either `path` or `content_bytes`.")
+
+
+def _attach_small(message_id: str, name: str, raw: bytes, content_type: str) -> dict:
+    """Attach a <3 MB file as an inline fileAttachment payload."""
+    return _graph_post(
+        f"/me/messages/{message_id}/attachments",
+        {
+            "@odata.type": "#microsoft.graph.fileAttachment",
+            "name": name,
+            "contentType": content_type,
+            "contentBytes": base64.b64encode(raw).decode("ascii"),
+        },
+    )
+
+
+def _attach_large(message_id: str, name: str, raw: bytes, content_type: str) -> dict:
+    """Attach a >=3 MB file via Graph's resumable upload session.
+
+    Graph requires chunked PUTs to the session URL with a Content-Range header.
+    The session URL is pre-authorized — no Bearer header on the chunk PUTs.
+    """
+    session = _graph_post(
+        f"/me/messages/{message_id}/attachments/createUploadSession",
+        {
+            "AttachmentItem": {
+                "attachmentType": "file",
+                "name": name,
+                "size": len(raw),
+                "contentType": content_type,
+            }
+        },
+    )
+    upload_url = session.get("uploadUrl")
+    if not upload_url:
+        raise RuntimeError(f"createUploadSession did not return uploadUrl: {session}")
+
+    total = len(raw)
+    offset = 0
+    last: dict[str, Any] = {}
+    while offset < total:
+        end = min(offset + ATTACHMENT_CHUNK_BYTES, total) - 1
+        chunk = raw[offset:end + 1]
+        r = requests.put(
+            upload_url,
+            headers={
+                "Content-Length": str(len(chunk)),
+                "Content-Range": f"bytes {offset}-{end}/{total}",
+            },
+            data=chunk,
+            timeout=120,
+        )
+        # 200/201 on the final chunk, 202 on intermediate chunks.
+        if r.status_code not in (200, 201, 202):
+            raise RuntimeError(
+                f"upload chunk {offset}-{end}/{total} failed "
+                f"({r.status_code}): {r.text[:300]}"
+            )
+        try:
+            last = r.json() if r.content else {}
+        except ValueError:
+            last = {}
+        offset = end + 1
+    return last or {"uploaded": True, "name": name, "size": total}
+
+
+def _attach_one(message_id: str, att: dict) -> dict:
+    name, raw, content_type = _resolve_attachment(att)
+    if len(raw) < ATTACHMENT_INLINE_MAX_BYTES:
+        return _attach_small(message_id, name, raw, content_type)
+    return _attach_large(message_id, name, raw, content_type)
+
+
+def _parse_attachments_json(attachments_json: str | None) -> list[dict]:
+    if not attachments_json:
+        return []
+    try:
+        items = json.loads(attachments_json)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"attachments_json is not valid JSON: {e}") from e
+    if not isinstance(items, list):
+        raise ValueError("attachments_json must be a JSON array of attachment objects.")
+    return items
+
+
 # ─── MCP server ─────────────────────────────────────────────────────────────
 
 mcp = FastMCP(
@@ -365,8 +505,29 @@ def outlook_email_read(message_id: str) -> dict:
 
 @mcp.tool()
 @requires_auth
-def outlook_email_draft(to: list[str], subject: str, body: str, cc: list[str] | None = None) -> dict:
-    """Create a draft email. Does NOT send. Returns the draft's ID."""
+def outlook_email_draft(
+    to: list[str],
+    subject: str,
+    body: str,
+    cc: list[str] | None = None,
+    attachments_json: str | None = None,
+) -> dict:
+    """Create a draft email. Does NOT send. Returns the draft's ID.
+
+    Args:
+        to: Recipient email addresses.
+        subject: Subject line.
+        body: Plain-text body.
+        cc: Optional CC recipients.
+        attachments_json: Optional JSON array of attachment specs. Each spec
+            is either {"path": "/abs/path/file.xlsx"} (preferred when the
+            file is on the agent's filesystem) or {"name": "file.xlsx",
+            "content_bytes": "<base64>"}. `content_type` is optional in
+            both forms — falls back to mimetypes.guess_type or
+            application/octet-stream. Files >=3 MB are uploaded via
+            Graph's resumable upload session automatically.
+    """
+    attachments = _parse_attachments_json(attachments_json)
     payload = {
         "subject": subject,
         "body": {"contentType": "Text", "content": body},
@@ -374,7 +535,17 @@ def outlook_email_draft(to: list[str], subject: str, body: str, cc: list[str] | 
         "ccRecipients": [{"emailAddress": {"address": a}} for a in (cc or [])],
     }
     draft = _graph_post("/me/messages", payload)
-    return {"id": draft["id"], "web_link": draft.get("webLink")}
+    draft_id = draft["id"]
+    attached_names: list[str] = []
+    for att in attachments:
+        result = _attach_one(draft_id, att)
+        if isinstance(result, dict) and result.get("name"):
+            attached_names.append(result["name"])
+    return {
+        "id": draft_id,
+        "web_link": draft.get("webLink"),
+        "attachments": attached_names,
+    }
 
 
 @mcp.tool()
@@ -386,22 +557,64 @@ def outlook_email_archive(message_id: str) -> dict:
 
 @mcp.tool()
 @requires_auth
-def outlook_email_send(message_id: str | None = None, to: list[str] | None = None,
-                       subject: str | None = None, body: str | None = None) -> dict:
+def outlook_email_send(
+    message_id: str | None = None,
+    to: list[str] | None = None,
+    subject: str | None = None,
+    body: str | None = None,
+    cc: list[str] | None = None,
+    attachments_json: str | None = None,
+) -> dict:
     """Send an email — either an existing draft (by ID) or a new one inline.
 
     DESTRUCTIVE — sending cannot be undone. Confirm with the user first.
+
+    Args:
+        message_id: Send an existing draft. If `attachments_json` is also
+            given, the files are attached to the draft before sending.
+        to, subject, body, cc: Inline-send fields. Required when
+            `message_id` is not given.
+        attachments_json: Optional JSON array of attachment specs. See
+            outlook_email_draft for the shape. Files >=3 MB use the
+            resumable upload session automatically. When attachments
+            are present in the inline-send path, the email is composed
+            as a draft and sent (one extra round-trip vs. plain
+            sendMail), since /me/sendMail doesn't accept large
+            attachments inline.
     """
+    attachments = _parse_attachments_json(attachments_json)
+
     if message_id:
-        # Send a previously-created draft
+        # Existing draft. Attach any newly-supplied files, then send.
+        for att in attachments:
+            _attach_one(message_id, att)
         return _graph_post(f"/me/messages/{message_id}/send", {})
+
     if not (to and subject and body):
         raise ValueError("Either message_id, or to+subject+body, must be provided.")
+
+    if attachments:
+        # Compose-and-send path with attachments: draft → attach → send.
+        # Reuses outlook_email_draft's logic so big files automatically use
+        # the resumable upload session.
+        draft = outlook_email_draft(
+            to=to, subject=subject, body=body, cc=cc, attachments_json=attachments_json
+        )
+        # outlook_email_draft is decorated with @requires_auth, which can
+        # return an auth_required dict instead of a draft id. Propagate that
+        # back unchanged so the agent prompts the user to sign in.
+        if isinstance(draft, dict) and draft.get("auth_required"):
+            return draft
+        _graph_post(f"/me/messages/{draft['id']}/send", {})
+        return {"sent": True, "id": draft["id"], "attachments": draft.get("attachments", [])}
+
+    # Plain inline send — fastest path, single round-trip.
     payload = {
         "message": {
             "subject": subject,
             "body": {"contentType": "Text", "content": body},
             "toRecipients": [{"emailAddress": {"address": a}} for a in to],
+            "ccRecipients": [{"emailAddress": {"address": a}} for a in (cc or [])],
         },
         "saveToSentItems": True,
     }

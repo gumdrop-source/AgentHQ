@@ -28,10 +28,10 @@
       "description": "Read one email's full body by message id"
     },
     "outlook_email_draft": {
-      "description": "Create a draft email in the user's mailbox (does NOT send)"
+      "description": "Create a draft email in the user's mailbox (does NOT send). Optional attachments_json — JSON array of {path} or {name, content_bytes} specs; files >=3 MB use a resumable upload session automatically."
     },
     "outlook_email_send": {
-      "description": "Send an email immediately",
+      "description": "Send an email immediately. Optional attachments_json — same shape as outlook_email_draft. Works for both compose-and-send and existing draft IDs.",
       "destructive": true
     },
     "outlook_email_archive": {
