@@ -1,0 +1,64 @@
+{
+  "name": "xero",
+  "title": "Xero Accounting",
+  "description": "Read-only access to Xero: contacts, sales invoices (AR), purchase bills (AP), chart of accounts, and P&L reports. Each user authenticates against their own Xero account and explicitly picks which connected organisation queries should run against.",
+  "credentials": [
+    {
+      "key": "xero_client_id",
+      "label": "Client ID",
+      "env": "XERO_CLIENT_ID",
+      "description": "Shown as 'Client id' on your registered app at developer.xero.com/myapps. (OAuth2 calls this the client_id.)"
+    },
+    {
+      "key": "xero_client_secret",
+      "label": "Client Secret",
+      "env": "XERO_CLIENT_SECRET",
+      "secret": true,
+      "description": "Shown as 'Client secret' on the same app page — generate at developer.xero.com/myapps → your app → Configuration → Generate a secret. Copy the VALUE, not the ID."
+    },
+    {
+      "key": "xero_refresh_token",
+      "label": "Admin Refresh Token",
+      "env": "XERO_REFRESH_TOKEN",
+      "secret": true,
+      "optional": true,
+      "hidden": true,
+      "description": "Not surfaced in the wizard. Each Telegram user runs their own sign-in dance the first time they ask the bot anything Xero-related — no platform-level token needed. Admins who want a platform token for direct/CLI use can set it via `sudo agenthq-cred set xero_refresh_token`."
+    }
+  ],
+  "tools": {
+    "xero_complete_auth": {
+      "description": "Finish the per-user OAuth dance — pass the redirect URL the user copied back from their browser"
+    },
+    "xero_who_am_i": {
+      "description": "Diagnostic: report whether the calling user has linked their Xero account and which organisation is currently active"
+    },
+    "xero_organisations": {
+      "description": "List the Xero organisations the linked user is connected to — used to populate xero_set_active_org"
+    },
+    "xero_set_active_org": {
+      "description": "Pick which connected organisation subsequent queries should run against — pass the tenant_id from xero_organisations. Required before any data tool will work, even if there's only one org."
+    },
+    "xero_organisation_info": {
+      "description": "Sanity check + metadata for the currently active organisation (legal name, base currency, country, financial year end)"
+    },
+    "xero_contacts": {
+      "description": "Search contacts (customers + suppliers) by name fragment — returns ContactID for drill-down"
+    },
+    "xero_invoices": {
+      "description": "List sales invoices (Type=ACCREC) — accounts receivable, what's owed TO the org. Optional date range and status filter."
+    },
+    "xero_bills": {
+      "description": "List purchase bills (Type=ACCPAY) — accounts payable, what the org owes. Optional date range and status filter."
+    },
+    "xero_accounts": {
+      "description": "List the chart of accounts — class filter (REVENUE, EXPENSE, ASSET, LIABILITY, EQUITY) and code prefix supported"
+    },
+    "xero_pl": {
+      "description": "Profit & Loss summary report between two dates"
+    },
+    "xero_raw_get": {
+      "description": "Escape hatch: GET an arbitrary Xero accounting endpoint with optional query params"
+    }
+  }
+}
