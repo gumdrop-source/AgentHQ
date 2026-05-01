@@ -59,12 +59,18 @@ LEGACY_REFRESH_TOKEN_FILE = HOME / "xero_refresh_token"
 OAUTH_AUTHORIZE_URL = "https://login.xero.com/identity/connect/authorize"
 OAUTH_TOKEN_URL = "https://identity.xero.com/connect/token"
 OAUTH_REDIRECT_URI = "http://localhost"
+# Broad scopes. The granular `.read` flavors (accounting.contacts.read etc)
+# require an opt-in that Web-app registrations don't get by default —
+# requesting them yields "unauthorized_client / Invalid scope for client"
+# at the authorize endpoint. The broad scopes have been available for every
+# OAuth2 app since 2020, so they're the safe default. Token has write
+# capability but our tool code only ever calls GETs.
 OAUTH_SCOPE = (
     "offline_access "
-    "accounting.contacts.read "
-    "accounting.transactions.read "
-    "accounting.reports.read "
-    "accounting.settings.read"
+    "accounting.contacts "
+    "accounting.transactions "
+    "accounting.settings "
+    "accounting.reports.read"
 )
 
 CONNECTIONS_URL = "https://api.xero.com/connections"
