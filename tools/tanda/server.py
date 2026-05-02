@@ -612,42 +612,82 @@ def tanda_timesheets(date: str, sender_id: str, show_costs: bool = False) -> Any
 # a Tanda user-role permission ("View staff costs") that returns 403 with
 # body "You do not have access to staff costs!" for accounts that lack it,
 # even when the OAuth token has the `cost` scope. /shifts?show_costs=true
-# does NOT trip the same gate. /shifts also accepts from/to natively, so
-# we don't have to fan out per day.
-
-# Tanda /shifts is paginated at 100 per page. Walk offset-based until a
-# short page comes back.
-SHIFTS_PAGE_SIZE = 100
+# does NOT trip the same gate.
+#
+# Shift schema (the fields we use, validated against a live POC):
+#   id            int
+#   user_id       int          (top-level — there is no nested `user` object)
+#   start         int          unix seconds
+#   finish        int          unix seconds  (NOT `end`)
+#   break_length  int          minutes (sum of all breaks)
+#   breaks        list[{length: minutes, paid: bool}]
+#   cost          float|null   dollars; null when unapproved/not yet costed
+#   status        str          APPROVED / DRAFT / ...
+#
+# Hours worked = (finish - start) / 3600  -  sum(breaks where !paid).length / 60
+# Only unpaid breaks subtract — paid breaks count as worked time.
+#
+# /shifts returns a flat JSON array. The POC fetched ~300 shifts/week
+# without any pagination params; we replicate that. If Tanda ever silently
+# caps the result, we surface a heuristic warning when `len == 100` (the
+# typical paginated default) so the operator knows to investigate.
 
 
 def _shift_hours(s: dict) -> float | None:
-    """Hours worked off a shift entry. Tanda's `mins_worked` is the
-    documented field; fall back to start/end/breaks math if it isn't
-    populated yet (e.g. for a future-rostered but not-yet-worked shift)."""
-    for key in ("mins_worked", "total_minutes", "duration_in_minutes"):
-        v = s.get(key)
-        if isinstance(v, (int, float)) and v >= 0:
-            return float(v) / 60.0
-    start = s.get("start") or s.get("start_time")
-    end = s.get("end") or s.get("finish") or s.get("finish_time") or s.get("end_time")
-    if isinstance(start, (int, float)) and isinstance(end, (int, float)) and end > start:
-        seconds = float(end) - float(start)
-        breaks = s.get("breaks_duration") or s.get("break_length") or 0
-        if isinstance(breaks, (int, float)) and breaks > 0:
-            seconds -= float(breaks) if breaks < 60 * 60 * 12 else float(breaks) * 60
-        return max(seconds, 0.0) / 3600.0
-    return None
+    """Hours actually worked on this shift, per Tanda's documented schema."""
+    start = s.get("start")
+    finish = s.get("finish") or s.get("end")  # /shifts uses 'finish'
+    if not (isinstance(start, (int, float)) and isinstance(finish, (int, float))):
+        return None
+    if finish <= start:
+        return None
+    span_hours = (float(finish) - float(start)) / 3600.0
+
+    unpaid_minutes = 0.0
+    breaks = s.get("breaks")
+    if isinstance(breaks, list):
+        for b in breaks:
+            if not isinstance(b, dict) or b.get("paid"):
+                continue
+            length = b.get("length")
+            if isinstance(length, (int, float)) and length > 0:
+                unpaid_minutes += float(length)
+    elif isinstance(s.get("break_length"), (int, float)) and s["break_length"] > 0:
+        # Fallback for shifts where the breaks[] array isn't present —
+        # break_length is the sum in minutes. We can't tell paid from
+        # unpaid here, so treat the whole sum as unpaid (the conservative
+        # choice for a labour-cost roll-up: undercount hours, never over).
+        unpaid_minutes = float(s["break_length"])
+
+    return max(0.0, span_hours - unpaid_minutes / 60.0)
 
 
-def _shift_user(s: dict) -> tuple[Any, str | None]:
-    user = s.get("user") if isinstance(s.get("user"), dict) else None
-    uid = (user or {}).get("id") or s.get("user_id") or s.get("staff_id")
-    name = None
-    if user:
-        name = user.get("name") or " ".join(
-            c for c in [user.get("first_name"), user.get("last_name")] if c
-        ).strip() or None
-    return uid, name or s.get("user_name")
+def _user_name_map(sender_id: str) -> dict[Any, str]:
+    """Build a {user_id: display_name} map by hitting /users once.
+
+    /shifts only returns user_id, not names — joining is the caller's job.
+    Falls back gracefully on permission errors so a user who can't list
+    /users still gets cost numbers (just with raw IDs).
+    """
+    try:
+        users = _get("/users", sender_id)
+    except Exception:
+        return {}
+    if not isinstance(users, list):
+        return {}
+    out: dict[Any, str] = {}
+    for u in users:
+        if not isinstance(u, dict):
+            continue
+        uid = u.get("id")
+        if uid is None:
+            continue
+        name = u.get("name") or " ".join(
+            c for c in [u.get("legal_first_name"), u.get("legal_last_name")] if c
+        ).strip()
+        if name:
+            out[uid] = name
+    return out
 
 
 @mcp.tool()
@@ -662,9 +702,9 @@ def tanda_labour_cost(
     """Per-user labour cost over a date range — answers "what did this
     period cost in wages?".
 
-    Hits /shifts?from=&to=&show_costs=true (paginated) and aggregates the
-    award-correct dollar cost Tanda computes per shift (overtime and
-    penalty rates included). Single-call, not per-day.
+    Hits /shifts?from=&to=&show_costs=true once and aggregates Tanda's
+    award-correct dollar cost (overtime and penalty rates included).
+    Joins user_id → name via /users so the response is human-readable.
 
     Args:
         start_date: ISO date 'YYYY-MM-DD' (inclusive).
@@ -673,9 +713,9 @@ def tanda_labour_cost(
 
     Requires the `cost` OAuth scope (tick `cost` on the registered Tanda
     app + each user re-runs the sign-in dance once). Shifts that come
-    back without a cost field — typically because they're unapproved /
-    not yet costed — are tallied separately in `warnings[]` so the
-    grand total reflects only the actually-costed work.
+    back with cost=null — typically because they're unapproved or not
+    yet costed — are tallied separately in `warnings[]` so the grand
+    total reflects only the actually-costed work.
     """
     sender = _resolve_sender(sender_id)
     if not (start_date and end_date):
@@ -684,70 +724,62 @@ def tanda_labour_cost(
         s.strip() for s in (user_ids or "").split(",") if s.strip()
     ) or None
 
+    name_by_uid = _user_name_map(sender)
+
+    params: dict[str, Any] = {
+        "from": start_date,
+        "to": end_date,
+        "show_costs": "true",
+    }
+    if user_filter:
+        params["user_ids"] = ",".join(sorted(user_filter))
+
+    payload = _get("/shifts", sender, params=params)
+    if isinstance(payload, dict):
+        # Defensive: in case a future Tanda revision wraps the array.
+        for key in ("shifts", "data"):
+            v = payload.get(key)
+            if isinstance(v, list):
+                payload = v
+                break
+        else:
+            payload = []
+    if not isinstance(payload, list):
+        payload = []
+
     by_user: dict[Any, dict[str, Any]] = {}
     total_hours = 0.0
     total_cost = 0.0
     total_shifts = 0
     uncosted_shifts = 0
-    offset = 0
 
-    while True:
-        params: dict[str, Any] = {
-            "from": start_date,
-            "to": end_date,
-            "show_costs": "true",
-            "limit": SHIFTS_PAGE_SIZE,
-            "offset": offset,
-        }
-        if user_filter:
-            params["user_ids"] = ",".join(sorted(user_filter))
-        page = _get("/shifts", sender, params=params)
-        if isinstance(page, dict):
-            # Tanda has shipped paginated responses both as bare lists
-            # and as {shifts: [...], data: [...]} wrappers — normalize.
-            for key in ("shifts", "data"):
-                v = page.get(key)
-                if isinstance(v, list):
-                    page = v
-                    break
-            else:
-                page = []
-        if not isinstance(page, list):
-            break
-
-        for s in page:
-            if not isinstance(s, dict):
-                continue
-            uid, name = _shift_user(s)
-            if uid is None:
-                continue
-            if user_filter and str(uid) not in user_filter:
-                continue
-            hours = _shift_hours(s)
-            cost = s.get("cost") if isinstance(s.get("cost"), (int, float)) else None
-            if cost is None:
-                uncosted_shifts += 1
-            row = by_user.setdefault(uid, {
-                "user_id": uid,
-                "name": name,
-                "hours_worked": 0.0,
-                "cost": 0.0,
-                "shift_count": 0,
-            })
-            if name and not row.get("name"):
-                row["name"] = name
-            if hours is not None:
-                row["hours_worked"] += hours
-                total_hours += hours
-            if cost is not None:
-                row["cost"] += cost
-                total_cost += cost
-            row["shift_count"] += 1
-            total_shifts += 1
-
-        if len(page) < SHIFTS_PAGE_SIZE:
-            break
-        offset += SHIFTS_PAGE_SIZE
+    for s in payload:
+        if not isinstance(s, dict):
+            continue
+        uid = s.get("user_id")
+        if uid is None:
+            continue
+        if user_filter and str(uid) not in user_filter:
+            continue
+        hours = _shift_hours(s)
+        cost = s.get("cost") if isinstance(s.get("cost"), (int, float)) else None
+        if cost is None:
+            uncosted_shifts += 1
+        row = by_user.setdefault(uid, {
+            "user_id": uid,
+            "name": name_by_uid.get(uid) or str(uid),
+            "hours_worked": 0.0,
+            "cost": 0.0,
+            "shift_count": 0,
+        })
+        if hours is not None:
+            row["hours_worked"] += hours
+            total_hours += hours
+        if cost is not None:
+            row["cost"] += cost
+            total_cost += cost
+        row["shift_count"] += 1
+        total_shifts += 1
 
     rows = sorted(by_user.values(), key=lambda r: r.get("cost") or 0.0, reverse=True)
     for r in rows:
@@ -760,6 +792,16 @@ def tanda_labour_cost(
             f"{uncosted_shifts} of {total_shifts} shifts had no cost field — "
             "usually means they're unapproved or haven't been costed yet. "
             "Total reflects only costed shifts."
+        )
+    if total_shifts == 100:
+        # Heuristic: a flat 100 in the result smells like a paginated cap.
+        # Tanda's /shifts has been observed to return everything in range
+        # without limit/offset, but if the count happens to be exactly the
+        # default page size, surface a hint.
+        warnings.append(
+            "Got exactly 100 shifts back — this may be a paginated cap "
+            "rather than the true total. Cross-check by narrowing the "
+            "date range and seeing if the count drops proportionally."
         )
 
     return {
