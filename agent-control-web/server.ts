@@ -995,6 +995,9 @@ app.get("/agent/:name", (c) => {
           <div class="flex gap-2">
             ${button("Permissions", { href: `/agent/${name}/permissions`, intent: "secondary" })}
             ${button("Refresh", { href: `/agent/${name}`, intent: "secondary" })}
+            <form method="POST" action="/agent/${name}/restart" class="inline-block">
+              ${button("Restart service", { intent: "secondary" })}
+            </form>
             <a href="/agent/${name}/delete" class="inline-block px-4 py-2 rounded-lg font-medium bg-rose-50 text-rose-700 hover:bg-rose-100 border border-rose-200">Delete</a>
           </div>
         </div>
@@ -1003,6 +1006,20 @@ app.get("/agent/:name", (c) => {
           <p class="mt-4 text-sm text-slate-600">If status is <code>active (running)</code>, message your bot in Telegram. It should reply.</p>
         `)}
     `, "agents", c.get("user")));
+});
+
+// Bounce the agent service. Used after code changes to MCP tool servers,
+// after credential rotations, or any time the long-lived agent process
+// needs to re-exec to pick up a fresh on-disk view. Cheap, low blast
+// radius — same as `sudo systemctl restart agent@<name>.service`.
+app.post("/agent/:name/restart", (c) => {
+    const name = c.req.param("name");
+    if (!/^[a-z][a-z0-9_-]{1,30}$/.test(name)) return c.html(errorPage("Invalid agent name"));
+    const r = spawnSync("systemctl", ["restart", `agent@${name}.service`], { encoding: "utf8" });
+    if (r.status !== 0) {
+        return c.html(errorPage(`Failed to restart agent@${name}.service`, r.stderr || r.stdout || ""));
+    }
+    return c.redirect(`/agent/${name}`);
 });
 
 // Delete confirmation page — never delete on a GET. Form posts to /delete
