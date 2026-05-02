@@ -53,7 +53,7 @@ LEGACY_REFRESH_TOKEN_FILE = HOME / "tanda_refresh_token"
 OAUTH_AUTHORIZE_URL = "https://my.tanda.co/api/oauth/authorize"
 OAUTH_TOKEN_URL = "https://my.tanda.co/api/oauth/token"
 OAUTH_REDIRECT_URI = "http://localhost"
-OAUTH_SCOPE = "me user roster timesheet leave"
+OAUTH_SCOPE = "me user roster timesheet leave cost"
 
 API_BASE = "https://my.tanda.co/api/v2"
 
@@ -553,6 +553,7 @@ def tanda_roster(
     start_date: str,
     end_date: str,
     user_ids: str | None = None,
+    show_costs: bool = False,
     *,
     sender_id: str,
 ) -> Any:
@@ -563,12 +564,19 @@ def tanda_roster(
         end_date: ISO date 'YYYY-MM-DD' (inclusive).
         user_ids: Optional comma-separated Tanda user_ids to restrict
             to. Omit to fetch everyone the caller is authorized to see.
+        show_costs: If true, ask Tanda to compute the dollar cost of each
+            shift (award-correct, includes overtime/penalty rates) and
+            return it as a `cost` field. Requires the `cost` OAuth scope —
+            users who linked before this scope was added will get an
+            empty/missing cost field; have them re-run the sign-in dance.
     """
     sender = _resolve_sender(sender_id)
     if not (start_date and end_date):
         raise ValueError("start_date and end_date are required (YYYY-MM-DD).")
     params: dict[str, Any] = {"from": start_date, "to": end_date}
     params.update(_user_ids_param(user_ids))
+    if show_costs:
+        params["show_costs"] = "true"
     return _get("/schedules", sender, params=params)
 
 
@@ -576,17 +584,225 @@ def tanda_roster(
 
 @mcp.tool()
 @requires_auth
-def tanda_timesheets(date: str, sender_id: str) -> Any:
+def tanda_timesheets(date: str, sender_id: str, show_costs: bool = False) -> Any:
     """Timesheet entries (clock-ins, breaks, shifts worked) for one date.
 
     Args:
         date: ISO date 'YYYY-MM-DD'. The endpoint returns one day at a
-            time — call it multiple times for a date range.
+            time — call it multiple times for a date range, or use
+            tanda_labour_cost which fans out for you.
+        show_costs: If true, ask Tanda to compute the dollar cost of each
+            timesheet (award-correct, includes overtime/penalty rates)
+            and return it as a `cost` field. Requires the `cost` OAuth
+            scope — users who linked before this scope was added need to
+            re-run the sign-in dance to get cost-bearing tokens.
     """
     sender = _resolve_sender(sender_id)
     if not date:
         raise ValueError("date is required (YYYY-MM-DD).")
-    return _get(f"/timesheets/on/{date}", sender)
+    params: dict[str, Any] = {}
+    if show_costs:
+        params["show_costs"] = "true"
+    return _get(f"/timesheets/on/{date}", sender, params=params or None)
+
+
+# ─── labour cost roll-up ───────────────────────────────────────────────────
+
+# Tanda's API doesn't have a multi-day timesheet endpoint, only
+# /timesheets/on/{date}. tanda_labour_cost fans out per-day inside the
+# server so the agent only does one round-trip and gets back a clean
+# per-user roll-up — the answer to "what did last week cost?".
+
+def _date_range(start_date: str, end_date: str) -> list[str]:
+    from datetime import date, timedelta
+    s = date.fromisoformat(start_date)
+    e = date.fromisoformat(end_date)
+    if e < s:
+        raise ValueError(f"end_date {end_date} is before start_date {start_date}")
+    if (e - s).days > 92:
+        # Fan-out is per-day, so wide ranges = lots of API calls. Cap at
+        # a quarter to avoid an accidental "give me last year" tanking
+        # the bot for minutes.
+        raise ValueError(
+            "Date range too wide (>92 days). Tanda has no multi-day "
+            "timesheet endpoint, so this tool fans out per day; cap a "
+            "single call at a quarter or split across multiple calls."
+        )
+    out: list[str] = []
+    d = s
+    while d <= e:
+        out.append(d.isoformat())
+        d += timedelta(days=1)
+    return out
+
+
+def _entries_from_timesheets_response(payload: Any) -> list[dict]:
+    """Tanda has shipped /timesheets responses in a few shapes over the
+    years (bare list, {timesheets: [...]}, {data: [...]}). Normalize."""
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("timesheets", "data", "entries"):
+            v = payload.get(key)
+            if isinstance(v, list):
+                return v
+    return []
+
+
+def _hours_for_entry(t: dict) -> float | None:
+    """Pull hours worked off a timesheet entry. Tries Tanda's documented
+    field, then computes from start/end/breaks if needed."""
+    for key in ("mins_worked", "total_minutes", "duration_in_minutes"):
+        v = t.get(key)
+        if isinstance(v, (int, float)) and v >= 0:
+            return float(v) / 60.0
+    start = t.get("start") or t.get("start_time")
+    end = t.get("end") or t.get("finish") or t.get("finish_time") or t.get("end_time")
+    if isinstance(start, (int, float)) and isinstance(end, (int, float)) and end > start:
+        seconds = float(end) - float(start)
+        breaks = t.get("breaks_duration") or t.get("break_length") or 0
+        if isinstance(breaks, (int, float)) and breaks > 0:
+            # Tanda usually reports breaks in seconds — defensively accept
+            # values <12h as seconds, larger as minutes-mistaken-for-hours.
+            seconds -= float(breaks) if breaks < 60 * 60 * 12 else float(breaks) * 60
+        return max(seconds, 0.0) / 3600.0
+    return None
+
+
+def _cost_for_entry(t: dict) -> float | None:
+    for key in ("cost", "total_cost", "labour_cost"):
+        v = t.get(key)
+        if isinstance(v, (int, float)):
+            return float(v)
+    return None
+
+
+def _user_ref(t: dict) -> tuple[Any, str | None]:
+    """Identify which user a timesheet entry belongs to. Tanda nests the
+    user as {user: {id, name}} in some responses and exposes user_id at
+    the top level in others."""
+    user = t.get("user") if isinstance(t.get("user"), dict) else None
+    uid = (
+        (user or {}).get("id")
+        or t.get("user_id")
+        or t.get("staff_id")
+    )
+    name = None
+    if user:
+        name = user.get("name") or " ".join(
+            c for c in [user.get("first_name"), user.get("last_name")] if c
+        ).strip() or None
+    name = name or t.get("user_name")
+    return uid, name
+
+
+@mcp.tool()
+@requires_auth
+def tanda_labour_cost(
+    start_date: str,
+    end_date: str,
+    user_ids: str | None = None,
+    *,
+    sender_id: str,
+) -> dict:
+    """Per-user labour cost over a date range — answers "what did this
+    period cost in wages?".
+
+    Fans out internally to /timesheets/on/{date}?show_costs=true for each
+    day in [start_date, end_date], then aggregates per user. Cost is
+    Tanda's award-correct calculation (includes overtime and penalty
+    rates), not a flat hourly multiplication.
+
+    Args:
+        start_date: ISO date 'YYYY-MM-DD' (inclusive). Capped at 92 days
+            from end_date — split larger ranges across multiple calls.
+        end_date: ISO date 'YYYY-MM-DD' (inclusive).
+        user_ids: Optional comma-separated Tanda user_ids to restrict to.
+
+    Requires the `cost` OAuth scope. Users who linked before the scope
+    was added will see cost=null on entries; they need to re-run the
+    sign-in dance to get cost-bearing tokens.
+    """
+    sender = _resolve_sender(sender_id)
+    if not (start_date and end_date):
+        raise ValueError("start_date and end_date are required (YYYY-MM-DD).")
+    dates = _date_range(start_date, end_date)
+    user_filter = set(
+        s.strip() for s in (user_ids or "").split(",") if s.strip()
+    ) or None
+
+    by_user: dict[Any, dict[str, Any]] = {}
+    total_hours = 0.0
+    total_cost = 0.0
+    total_entries = 0
+    cost_missing_count = 0
+
+    for d in dates:
+        payload = _get(
+            f"/timesheets/on/{d}",
+            sender,
+            params={"show_costs": "true"},
+        )
+        for t in _entries_from_timesheets_response(payload):
+            if not isinstance(t, dict):
+                continue
+            uid, name = _user_ref(t)
+            if uid is None:
+                continue
+            if user_filter and str(uid) not in user_filter:
+                continue
+            hours = _hours_for_entry(t)
+            cost = _cost_for_entry(t)
+            if cost is None:
+                cost_missing_count += 1
+            row = by_user.setdefault(uid, {
+                "user_id": uid,
+                "name": name,
+                "hours_worked": 0.0,
+                "cost": 0.0,
+                "timesheet_count": 0,
+            })
+            if name and not row.get("name"):
+                row["name"] = name
+            if hours is not None:
+                row["hours_worked"] += hours
+                total_hours += hours
+            if cost is not None:
+                row["cost"] += cost
+                total_cost += cost
+            row["timesheet_count"] += 1
+            total_entries += 1
+
+    rows = sorted(
+        by_user.values(),
+        key=lambda r: r.get("cost") or 0.0,
+        reverse=True,
+    )
+    for r in rows:
+        r["hours_worked"] = round(r["hours_worked"], 2)
+        r["cost"] = round(r["cost"], 2)
+
+    return {
+        "start_date": start_date,
+        "end_date": end_date,
+        "days": len(dates),
+        "by_user": rows,
+        "totals": {
+            "hours_worked": round(total_hours, 2),
+            "cost": round(total_cost, 2),
+            "user_count": len(rows),
+            "timesheet_count": total_entries,
+        },
+        "warnings": (
+            [
+                f"{cost_missing_count} timesheet entries had no cost field — "
+                "the calling user's token likely predates the `cost` OAuth "
+                "scope. Re-run the sign-in dance to refresh consent."
+            ]
+            if cost_missing_count
+            else []
+        ),
+    }
 
 
 # ─── leave ─────────────────────────────────────────────────────────────────

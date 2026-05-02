@@ -23,7 +23,8 @@ user the first time they use the bot.
    - **Name** — anything, internal label only (e.g. `AgentHQ`)
    - **Redirect URI** — `http://localhost`  (must match exactly,
      including the lack of a trailing slash)
-   - **Scopes** — tick: `me`, `user`, `roster`, `timesheet`, `leave`
+   - **Scopes** — tick: `me`, `user`, `roster`, `timesheet`, `leave`,
+     `cost`
 4. After registration, note the **Application ID** and **Secret** —
    you'll paste these into AgentHQ's setup wizard as **Application
    ID** and **Application Secret**.
@@ -31,13 +32,13 @@ user the first time they use the bot.
 The full scope string the tool uses is:
 
 ```
-me user roster timesheet leave
+me user roster timesheet leave cost
 ```
 
-If you also want cost data (pay rates, wage costs in roster summaries),
-add `cost` in Tanda and append it to `OAUTH_SCOPE` in
-`tools/tanda/server.py`. Defaulting to no `cost` keeps each user's view
-tighter.
+The `cost` scope gates Tanda's award-correct dollar-cost fields on
+timesheets / shifts / rosters and powers the `tanda_labour_cost`
+roll-up tool. Drop it from `OAUTH_SCOPE` in `tools/tanda/server.py`
+if you don't want labour-cost questions to be answerable.
 
 ## 2. Activate the integration in AgentHQ (admin, one time)
 
@@ -92,6 +93,16 @@ If the user has already authorized once and the bot is asking again,
 the previous refresh token has been invalidated — usually because
 another client used it (Tanda refresh tokens are single-use and rotate
 on every refresh). Just redo the dance.
+
+**Re-auth required after a scope change:** if the operator adds a new
+scope to `OAUTH_SCOPE` (e.g. `cost`), every user who authorized
+*before* the change still has a token whose consent doesn't cover the
+new scope. The tool won't auto-prompt them — `tanda_who_am_i` will
+still report `linked: true`. The symptom is fields silently coming
+back as null (e.g. `tanda_labour_cost` returns `cost: 0` for everyone
+plus a warning in `warnings[]`). Fix: have each affected user delete
+their cached token (or run the dance again from scratch) so the new
+consent screen surfaces the added scope.
 
 ## 5. Diagnostics
 

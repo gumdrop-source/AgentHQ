@@ -40,10 +40,13 @@
       "description": "Find employees by name or email — resolves a person into their Tanda user_id"
     },
     "tanda_roster": {
-      "description": "Roster / schedule entries between two dates — optionally filter to specific user_ids"
+      "description": "Roster / schedule entries between two dates — optionally filter to specific user_ids. Pass show_costs=true to include Tanda's award-correct dollar cost per shift (requires `cost` scope)."
     },
     "tanda_timesheets": {
-      "description": "Timesheet entries (clock-ins / shifts worked) for one date — what people actually did, vs. what they were rostered for"
+      "description": "Timesheet entries (clock-ins / shifts worked) for one date — what people actually did, vs. what they were rostered for. Pass show_costs=true for Tanda's award-correct dollar cost per timesheet."
+    },
+    "tanda_labour_cost": {
+      "description": "Per-user labour cost roll-up over a date range — answers 'what did this period cost in wages?'. Fans out per-day internally, returns per-user hours + cost + grand total. Award-correct (overtime/penalties), not flat hourly."
     },
     "tanda_leave_requests": {
       "description": "Leave requests overlapping a date range — optionally filter to specific user_ids"
