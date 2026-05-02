@@ -141,8 +141,16 @@ setups (the typical pattern today) this isn't a concern.
   the user revoked the app). The tool detects this, deletes the stale
   token file, and prompts the user to re-authorize on the next call.
 - **`invalid_scope` on the authorize URL** — the registered Tanda app
-  doesn't have all five scopes ticked. Edit the app in Tanda and add
-  any missing ones from `me user roster timesheet leave`.
+  doesn't have all the scopes ticked. Edit the app in Tanda and add
+  any missing ones from `me user roster timesheet leave cost`.
+- **`403 / "You do not have access to staff costs!"`** when calling
+  cost-bearing tools — the linked user's Tanda role lacks the "View
+  staff costs" permission (this is a per-user role gate, separate
+  from the `cost` OAuth scope). A Tanda admin needs to grant it via
+  Settings → Permissions → Roles. NB: `tanda_labour_cost` deliberately
+  uses `/shifts?show_costs=true` rather than `/timesheets/on/{date}?show_costs=true`
+  because the latter trips this gate harder; the shifts endpoint
+  generally works for any account whose role can see rostered shifts.
 - **`401` on every call** — system-clock drift can cause Tanda to
   reject fresh access tokens. The tool retries once automatically;
   persistent 401s mean the host clock is wrong.
