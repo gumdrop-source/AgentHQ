@@ -1,0 +1,80 @@
+{
+  "name": "rms",
+  "title": "RMS Cloud (PMS)",
+  "description": "Read-only access to RMS Cloud property management system: reservations, daily revenue, properties, and reports. Single shared service-account auth (Agent ID + Client ID + Web Service password). Designed for revenue / occupancy reporting against Halcyon House and other RMS-managed properties.",
+  "credentials": [
+    {
+      "key": "rms_agent_id",
+      "label": "Agent ID",
+      "env": "RMS_AGENT_ID",
+      "description": "Numeric Agent ID assigned by RMS when you became an API partner (e.g. 1249 for Gigafy). Visible on the Partner Welcome email and the Partner Portal."
+    },
+    {
+      "key": "rms_agent_password",
+      "label": "Agent password",
+      "env": "RMS_AGENT_PASSWORD",
+      "secret": true,
+      "description": "Agent-level password from the RMS Partner Welcome email (delivered via Bitwarden Send)."
+    },
+    {
+      "key": "rms_client_id",
+      "label": "Client ID",
+      "env": "RMS_CLIENT_ID",
+      "description": "Numeric RMS Client ID for the property (Halcyon House = 23267). Multi-property databases use the parent record's id; the authToken response will tell you whether you're standalone or multi."
+    },
+    {
+      "key": "rms_client_password",
+      "label": "Web Service password",
+      "env": "RMS_CLIENT_PASSWORD",
+      "secret": true,
+      "description": "RMS-side Web Service password for the client/property. Issued by the RMS customer (operator of the property) — when asking the property manager for it, use the wording 'Web Service password'."
+    },
+    {
+      "key": "rms_module_type",
+      "label": "Module type",
+      "env": "RMS_MODULE_TYPE",
+      "optional": true,
+      "description": "Comma-separated module types to request on each authToken (e.g. 'revenueManagement'). Defaults to 'revenueManagement' which matches the Revenue Management module Nish put on Halcyon's subscription. Override only if Tanda-style multiple modules are needed."
+    },
+    {
+      "key": "rms_use_training",
+      "label": "Use training database (sandbox)",
+      "env": "RMS_USE_TRAINING",
+      "optional": true,
+      "description": "Set to 'true' to point at RMS's training/sandbox database (the SBX environment in the partner welcome). 'false' (or unset) uses production. Recommended: leave true until you've verified queries against sandbox data."
+    },
+    {
+      "key": "rms_base_url",
+      "label": "API base URL override",
+      "env": "RMS_BASE_URL",
+      "optional": true,
+      "description": "Override the default RMS server base URL. Normally the tool calls /clienturl/{rmsClientId} and routes to whichever regional restapi*.rmscloud.com server RMS pins this client to. Set this only if you need to force a specific server (e.g. for sandbox testing on betarestapi*.rmscloud.com)."
+    }
+  ],
+  "tools": {
+    "rms_who_am_i": {
+      "description": "Diagnostic — current authToken validity, expiry, rmsClientId, and the list of properties accessible to the credentials. Use this first after activation to confirm the creds work and that you're hitting the right database (training vs production)."
+    },
+    "rms_properties": {
+      "description": "List the properties the credentials have access to (id, name, country, currency, financial year, time zone)."
+    },
+    "rms_reservations": {
+      "description": "POST /reservations/search — list reservations matching a date-range / status filter. Returns basic reservation records (id, dates, area, category, status, guest). Pass arrive_from / arrive_to / depart_from / depart_to as YYYY-MM-DD."
+    },
+    "rms_reservation_revenue": {
+      "description": "GET /reservations/{id}/dailyRevenue — accommodation, F&B, and 'other' revenue per night for one reservation, with GST/tax breakdown. For multiple reservations, prefer rms_revenue_summary which batches via /reservations/dailyRevenue/search."
+    },
+    "rms_revenue_summary": {
+      "description": "Headline revenue tool — answers 'what was last week's revenue?'. Searches reservations active in the date range, batches their IDs through /reservations/dailyRevenue/search (50 per call, server-side rolled up), and returns per-day totals + a grand total split by accommodation / F&B / other."
+    },
+    "rms_report": {
+      "description": "POST /reports/{report_type} — run one of RMS's built-in reports. Common report_types: occupancy, occupancyByArea, occupancyRevenueComparison, flash, performanceII, pace, historyForecast. Pass params_json with the report-specific body."
+    },
+    "rms_raw_get": {
+      "description": "Escape hatch: GET an arbitrary RMS REST API path with optional query params. Path is relative to the discovered/configured client base URL."
+    },
+    "rms_raw_post": {
+      "description": "Escape hatch: POST an arbitrary RMS REST API path with a JSON body. Read-only by intent — only use against documented search/report POSTs."
+    }
+  }
+}
