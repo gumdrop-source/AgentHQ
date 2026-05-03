@@ -53,7 +53,7 @@ LEGACY_REFRESH_TOKEN_FILE = HOME / "tanda_refresh_token"
 OAUTH_AUTHORIZE_URL = "https://my.tanda.co/api/oauth/authorize"
 OAUTH_TOKEN_URL = "https://my.tanda.co/api/oauth/token"
 OAUTH_REDIRECT_URI = "http://localhost"
-OAUTH_SCOPE = "me user roster timesheet leave cost"
+OAUTH_SCOPE = "me user roster timesheet leave cost department organisation"
 
 API_BASE = "https://my.tanda.co/api/v2"
 
@@ -538,6 +538,40 @@ def tanda_user_lookup(query: str, sender_id: str) -> list[dict]:
     return [_summarize_user(u) for u in items if isinstance(u, dict) and _user_record_matches(u, needle)]
 
 
+# ─── departments ───────────────────────────────────────────────────────────
+
+def _summarize_department(d: dict) -> dict:
+    return {
+        "id": d.get("id"),
+        "name": d.get("name"),
+        "parent_id": d.get("parent_id") or d.get("parent_department_id"),
+        "location_id": d.get("location_id"),
+        "active": d.get("active") if d.get("active") is not None else d.get("is_active"),
+    }
+
+
+@mcp.tool()
+@requires_auth
+def tanda_departments(sender_id: str) -> list[dict]:
+    """List the departments configured for the org (id, name, parent, location).
+
+    Use the returned `id` as `department_id` on tanda_labour_cost to
+    restrict the cost roll-up to one department, or to interpret the
+    `by_department` breakdown.
+
+    Requires the `department` OAuth scope. Users who linked before that
+    scope was added need to re-run the sign-in dance.
+    """
+    sender = _resolve_sender(sender_id)
+    data = _get("/departments", sender)
+    items = data if isinstance(data, list) else (
+        (data or {}).get("departments") or (data or {}).get("data") or []
+    )
+    if not isinstance(items, list):
+        return []
+    return [_summarize_department(d) for d in items if isinstance(d, dict)]
+
+
 # ─── rosters / schedules ───────────────────────────────────────────────────
 
 def _user_ids_param(user_ids_csv: str | None) -> dict[str, str]:
@@ -690,12 +724,37 @@ def _user_name_map(sender_id: str) -> dict[Any, str]:
     return out
 
 
+def _department_name_map(sender_id: str) -> dict[Any, str]:
+    """{department_id: name} map — same idea as _user_name_map. Falls back
+    silently if the calling user's token doesn't have the `department`
+    scope, leaving the by_department breakdown labelled with raw IDs."""
+    try:
+        data = _get("/departments", sender_id)
+    except Exception:
+        return {}
+    items = data if isinstance(data, list) else (
+        (data or {}).get("departments") or (data or {}).get("data") or []
+    )
+    if not isinstance(items, list):
+        return {}
+    out: dict[Any, str] = {}
+    for d in items:
+        if not isinstance(d, dict):
+            continue
+        did = d.get("id")
+        name = d.get("name")
+        if did is not None and name:
+            out[did] = name
+    return out
+
+
 @mcp.tool()
 @requires_auth
 def tanda_labour_cost(
     start_date: str,
     end_date: str,
     user_ids: str | None = None,
+    department_id: str | None = None,
     *,
     sender_id: str,
 ) -> dict:
@@ -704,15 +763,21 @@ def tanda_labour_cost(
 
     Hits /shifts?from=&to=&show_costs=true once and aggregates Tanda's
     award-correct dollar cost (overtime and penalty rates included).
-    Joins user_id → name via /users so the response is human-readable.
+    Joins user_id → name via /users and department_id → name via
+    /departments so the response is human-readable.
 
     Args:
         start_date: ISO date 'YYYY-MM-DD' (inclusive).
         end_date: ISO date 'YYYY-MM-DD' (inclusive).
         user_ids: Optional comma-separated Tanda user_ids to restrict to.
+        department_id: Optional single department_id to restrict to —
+            useful for "what did the kitchen cost last week?". Get IDs
+            from tanda_departments.
 
     Requires the `cost` OAuth scope (tick `cost` on the registered Tanda
-    app + each user re-runs the sign-in dance once). Shifts that come
+    app + each user re-runs the sign-in dance once). The `department`
+    scope is required for the `by_department` breakdown to carry names —
+    without it, breakdowns label by raw department_id. Shifts that come
     back with cost=null — typically because they're unapproved or not
     yet costed — are tallied separately in `warnings[]` so the grand
     total reflects only the actually-costed work.
@@ -723,8 +788,10 @@ def tanda_labour_cost(
     user_filter = set(
         s.strip() for s in (user_ids or "").split(",") if s.strip()
     ) or None
+    dept_filter = (department_id or "").strip() or None
 
     name_by_uid = _user_name_map(sender)
+    name_by_did = _department_name_map(sender)
 
     params: dict[str, Any] = {
         "from": start_date,
@@ -733,6 +800,10 @@ def tanda_labour_cost(
     }
     if user_filter:
         params["user_ids"] = ",".join(sorted(user_filter))
+    if dept_filter:
+        # Tanda /shifts accepts department_id as a server-side filter
+        # — push it to the API so we don't pull and discard.
+        params["department_id"] = dept_filter
 
     payload = _get("/shifts", sender, params=params)
     if isinstance(payload, dict):
@@ -748,6 +819,7 @@ def tanda_labour_cost(
         payload = []
 
     by_user: dict[Any, dict[str, Any]] = {}
+    by_dept: dict[Any, dict[str, Any]] = {}
     total_hours = 0.0
     total_cost = 0.0
     total_shifts = 0
@@ -761,11 +833,19 @@ def tanda_labour_cost(
             continue
         if user_filter and str(uid) not in user_filter:
             continue
+        did = s.get("department_id")
+        # Belt-and-braces: if Tanda ever ignores the department_id query
+        # param and returns shifts for other departments, drop them
+        # client-side too.
+        if dept_filter and str(did) != dept_filter:
+            continue
+
         hours = _shift_hours(s)
         cost = s.get("cost") if isinstance(s.get("cost"), (int, float)) else None
         if cost is None:
             uncosted_shifts += 1
-        row = by_user.setdefault(uid, {
+
+        urow = by_user.setdefault(uid, {
             "user_id": uid,
             "name": name_by_uid.get(uid) or str(uid),
             "hours_worked": 0.0,
@@ -773,16 +853,37 @@ def tanda_labour_cost(
             "shift_count": 0,
         })
         if hours is not None:
-            row["hours_worked"] += hours
+            urow["hours_worked"] += hours
             total_hours += hours
         if cost is not None:
-            row["cost"] += cost
+            urow["cost"] += cost
             total_cost += cost
-        row["shift_count"] += 1
+        urow["shift_count"] += 1
+
+        # Department roll-up. did=None lands in a "(no department)"
+        # bucket so the totals always reconcile.
+        dkey = did if did is not None else "__no_dept__"
+        drow = by_dept.setdefault(dkey, {
+            "department_id": did,
+            "name": name_by_did.get(did) or (str(did) if did is not None else "(no department)"),
+            "hours_worked": 0.0,
+            "cost": 0.0,
+            "shift_count": 0,
+        })
+        if hours is not None:
+            drow["hours_worked"] += hours
+        if cost is not None:
+            drow["cost"] += cost
+        drow["shift_count"] += 1
+
         total_shifts += 1
 
-    rows = sorted(by_user.values(), key=lambda r: r.get("cost") or 0.0, reverse=True)
-    for r in rows:
+    user_rows = sorted(by_user.values(), key=lambda r: r.get("cost") or 0.0, reverse=True)
+    for r in user_rows:
+        r["hours_worked"] = round(r["hours_worked"], 2)
+        r["cost"] = round(r["cost"], 2)
+    dept_rows = sorted(by_dept.values(), key=lambda r: r.get("cost") or 0.0, reverse=True)
+    for r in dept_rows:
         r["hours_worked"] = round(r["hours_worked"], 2)
         r["cost"] = round(r["cost"], 2)
 
@@ -807,11 +908,13 @@ def tanda_labour_cost(
     return {
         "start_date": start_date,
         "end_date": end_date,
-        "by_user": rows,
+        "by_user": user_rows,
+        "by_department": dept_rows,
         "totals": {
             "hours_worked": round(total_hours, 2),
             "cost": round(total_cost, 2),
-            "user_count": len(rows),
+            "user_count": len(user_rows),
+            "department_count": len(dept_rows),
             "shift_count": total_shifts,
         },
         "warnings": warnings,

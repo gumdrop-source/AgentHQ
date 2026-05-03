@@ -24,7 +24,7 @@ user the first time they use the bot.
    - **Redirect URI** — `http://localhost`  (must match exactly,
      including the lack of a trailing slash)
    - **Scopes** — tick: `me`, `user`, `roster`, `timesheet`, `leave`,
-     `cost`
+     `cost`, `department`, `organisation`
 4. After registration, note the **Application ID** and **Secret** —
    you'll paste these into AgentHQ's setup wizard as **Application
    ID** and **Application Secret**.
@@ -32,13 +32,24 @@ user the first time they use the bot.
 The full scope string the tool uses is:
 
 ```
-me user roster timesheet leave cost
+me user roster timesheet leave cost department organisation
 ```
 
-The `cost` scope gates Tanda's award-correct dollar-cost fields on
-timesheets / shifts / rosters and powers the `tanda_labour_cost`
-roll-up tool. Drop it from `OAUTH_SCOPE` in `tools/tanda/server.py`
-if you don't want labour-cost questions to be answerable.
+What each scope unlocks:
+
+- `cost` — Tanda's award-correct dollar-cost fields on shifts (powers
+  `tanda_labour_cost`)
+- `department` — `/departments` endpoint (powers `tanda_departments`
+  and the `by_department` breakdown in `tanda_labour_cost`)
+- `organisation` — org-level fields and endpoints (no dedicated tool
+  yet, but lots of nested objects in shifts/users/departments
+  reference org records, so without this scope some name lookups can
+  silently fail)
+
+Drop any scope you don't need from `OAUTH_SCOPE` in
+`tools/tanda/server.py` — the affected tools will return more limited
+data (e.g. without `department`, `tanda_labour_cost`'s by_department
+section labels everything by raw IDs).
 
 ## 2. Activate the integration in AgentHQ (admin, one time)
 
